@@ -23,6 +23,7 @@ concurrency:
 
 jobs:
   tailcat:
+    if: github.repository == 'tailscale/tailscale'
     name: heads-up-hypothetical-tailcat-build-using-this-commit
     runs-on: ubuntu-latest
     steps:
