@@ -290,8 +290,10 @@ type MagicDNSHosts interface {
 
 // SetMagicDNSHosts installs the live MagicDNS host source consulted
 // by forward and reverse MagicDNS lookups that miss [Config.Hosts].
-// It is expected to be called once, before the resolver serves
-// queries.
+// Installing a source also enables the MagicDNS aliases: the symbolic
+// service name, 4via6 names and translated 4to6 reverse lookups.
+// SetMagicDNSHosts is expected to be called once, before the resolver
+// serves queries.
 func (r *Resolver) SetMagicDNSHosts(h MagicDNSHosts) {
 	if !buildfeatures.HasDNS {
 		return
@@ -741,10 +743,17 @@ func (r *Resolver) resolveLocal(domain dnsname.FQDN, typ dns.Type) (netip.Addr, 
 		return netip.Addr{}, dns.RCodeNameError
 	}
 
+	r.mu.Lock()
+	hosts := r.hostToIP
+	localDomains := r.localDomains
+	subdomainHosts := r.subdomainHosts
+	magicHosts := r.magicHosts
+	r.mu.Unlock()
+
 	// We return a symbolic domain if someone does a reverse lookup on the
 	// DNS endpoint. To round out this special case, we also do the inverse
 	// (returning the endpoint IP if someone looks up the symbolic domain).
-	if domain == dnsSymbolicFQDN {
+	if magicHosts != nil && domain == dnsSymbolicFQDN {
 		switch typ {
 		case dns.TypeA:
 			return tsaddr.TailscaleServiceIP(), dns.RCodeSuccess
@@ -753,16 +762,9 @@ func (r *Resolver) resolveLocal(domain dnsname.FQDN, typ dns.Type) (netip.Addr, 
 		}
 	}
 	// Special-case: 4via6 DNS names.
-	if ip, ok := r.resolveViaDomain(domain, typ); ok {
+	if ip, ok := r.resolveViaDomain(domain, typ); ok && magicHosts != nil {
 		return ip, dns.RCodeSuccess
 	}
-
-	r.mu.Lock()
-	hosts := r.hostToIP
-	localDomains := r.localDomains
-	subdomainHosts := r.subdomainHosts
-	magicHosts := r.magicHosts
-	r.mu.Unlock()
 
 	addrs, found := hosts[domain]
 	if !found && magicHosts != nil {
@@ -932,7 +934,7 @@ func (r *Resolver) resolveLocalReverse(name dnsname.FQDN) (dnsname.FQDN, dns.RCo
 
 	// If the requested IP is part of the IPv6 4-to-6 range, it might
 	// correspond to an IPv4 address (assuming IPv4 is enabled).
-	if ip4, ok := tsaddr.Tailscale6to4(ip); ok {
+	if ip4, ok := tsaddr.Tailscale6to4(ip); ok && r.magicHosts != nil {
 		fqdn, code := r.fqdnForIPLocked(ip4, name)
 		if code == dns.RCodeSuccess {
 			return fqdn, code
@@ -947,7 +949,7 @@ func (r *Resolver) fqdnForIPLocked(ip netip.Addr, name dnsname.FQDN) (dnsname.FQ
 	// return a domain that helps indicate that Tailscale is using
 	// this IP for a special purpose and it is not a node on their
 	// tailnet.
-	if ip == tsaddr.TailscaleServiceIP() || ip == tsaddr.TailscaleServiceIPv6() {
+	if r.magicHosts != nil && (ip == tsaddr.TailscaleServiceIP() || ip == tsaddr.TailscaleServiceIPv6()) {
 		return dnsSymbolicFQDN, dns.RCodeSuccess
 	}
 

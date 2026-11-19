@@ -26,6 +26,7 @@ import (
 	"tailscale.com/health"
 	"tailscale.com/net/netaddr"
 	"tailscale.com/net/netmon"
+	"tailscale.com/net/tsaddr"
 	"tailscale.com/net/tsdial"
 	"tailscale.com/tstest"
 	"tailscale.com/types/dnstype"
@@ -370,6 +371,7 @@ func newResolver(t testing.TB) *Resolver {
 func TestResolveLocal(t *testing.T) {
 	r := newResolver(t)
 	defer r.Close()
+	r.SetMagicDNSHosts(fakeMagicDNSHosts{})
 
 	r.SetConfig(dnsCfg)
 
@@ -586,6 +588,7 @@ func TestResolveLocalMagicDNSHosts(t *testing.T) {
 func TestResolveLocalReverse(t *testing.T) {
 	r := newResolver(t)
 	defer r.Close()
+	r.SetMagicDNSHosts(fakeMagicDNSHosts{})
 
 	r.SetConfig(dnsCfg)
 
@@ -1861,5 +1864,113 @@ func TestLocalResponseTCFlagIntegration(t *testing.T) {
 				t.Logf("Warning: Local response is unusually large: %d bytes", len(response))
 			}
 		})
+	}
+}
+
+// viaName has the form of a 4via6 alias.
+const viaName = "192-0-2-1-via-1."
+
+// Tests that without a MagicDNS source, configured records named like the
+// MagicDNS aliases resolve to their own addresses.
+func TestExplicitDNSRecords(t *testing.T) {
+	v4 := netip.MustParseAddr("100.70.1.9")
+	v6 := tsaddr.Tailscale4To6(v4)
+	service := tsaddr.TailscaleServiceIP()
+	custom := netip.MustParseAddr("fd42::8")
+	r := newResolver(t)
+	defer r.Close()
+	err := r.SetConfig(Config{Hosts: map[dnsname.FQDN][]netip.Addr{
+		viaName:             {v4},
+		dnsSymbolicFQDN:     {custom},
+		"v6.example.":       {v6},
+		"resolver.example.": {service},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkLocalHost(t, r, viaName, dns.TypeA, v4)
+	checkLocalHost(t, r, viaName, dns.TypeAAAA, netip.Addr{})
+	checkLocalHost(t, r, dnsSymbolicFQDN, dns.TypeAAAA, custom)
+	checkLocalPTR(t, r, v6, "v6.example.", dns.RCodeSuccess)
+	checkLocalPTR(t, r, service, "resolver.example.", dns.RCodeSuccess)
+}
+
+func TestMagicDNS4via6AliasPrecedence(t *testing.T) {
+	r := newResolver(t)
+	defer r.Close()
+	r.SetMagicDNSHosts(fakeMagicDNSHosts{})
+	if err := r.SetConfig(Config{Hosts: map[dnsname.FQDN][]netip.Addr{
+		viaName: {netip.MustParseAddr("100.70.1.9")},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	checkLocalHost(t, r, viaName, dns.TypeA, netip.Addr{})
+	checkLocalHost(t, r, viaName, dns.TypeAAAA, netip.MustParseAddr("fd7a:115c:a1e0:b1a:0:1:192.0.2.1"))
+}
+
+// Tests that the MagicDNS aliases answer only with a MagicDNS source.
+func TestMagicDNSAliasFallback(t *testing.T) {
+	const v4Host = "v4.example."
+	v4 := netip.MustParseAddr("100.70.1.9")
+	// A translated PTR can succeed here only through the IPv4 record.
+	hosts := map[dnsname.FQDN][]netip.Addr{v4Host: {v4}}
+	for _, tc := range []struct {
+		name          string
+		source        MagicDNSHosts
+		domains       []dnsname.FQDN
+		code          dns.RCode
+		servicePTR    dnsname.FQDN
+		translatedPTR dnsname.FQDN
+	}{
+		{name: "forward", code: dns.RCodeRefused},
+		{name: "authoritative", domains: []dnsname.FQDN{"."}, code: dns.RCodeNameError},
+		{
+			name:          "magicdns",
+			source:        fakeMagicDNSHosts{},
+			code:          dns.RCodeSuccess,
+			servicePTR:    dnsSymbolicFQDN,
+			translatedPTR: v4Host,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newResolver(t)
+			defer r.Close()
+			if tc.source != nil {
+				r.SetMagicDNSHosts(tc.source)
+			}
+			if err := r.SetConfig(Config{Hosts: hosts, LocalDomains: tc.domains}); err != nil {
+				t.Fatal(err)
+			}
+			for _, name := range []dnsname.FQDN{dnsSymbolicFQDN, viaName} {
+				for _, typ := range []dns.Type{dns.TypeA, dns.TypeAAAA} {
+					if _, code := r.resolveLocal(name, typ); code != tc.code {
+						t.Errorf("%s %s = %v, want %v", name, typ, code, tc.code)
+					}
+				}
+			}
+			checkLocalPTR(t, r, tsaddr.TailscaleServiceIP(), tc.servicePTR, tc.code)
+			checkLocalPTR(t, r, tsaddr.TailscaleServiceIPv6(), tc.servicePTR, tc.code)
+			checkLocalPTR(t, r, tsaddr.Tailscale4To6(v4), tc.translatedPTR, tc.code)
+		})
+	}
+}
+
+func checkLocalHost(t *testing.T, r *Resolver, name dnsname.FQDN, typ dns.Type, want netip.Addr) {
+	t.Helper()
+	ip, code := r.resolveLocal(name, typ)
+	if code != dns.RCodeSuccess || ip != want {
+		t.Errorf("%s %s = %v, %v, want %v, NOERROR", name, typ, ip, code, want)
+	}
+}
+
+func checkLocalPTR(t *testing.T, r *Resolver, ip netip.Addr, want dnsname.FQDN, wantCode dns.RCode) {
+	t.Helper()
+	arpa, err := miekdns.ReverseAddr(ip.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, code := r.resolveLocalReverse(dnsname.FQDN(arpa))
+	if code != wantCode || got != want {
+		t.Errorf("PTR %s = %q, %v, want %q, %v", ip, got, code, want, wantCode)
 	}
 }
