@@ -5,11 +5,13 @@ package netmon
 
 import (
 	"io"
+	"net"
 	"net/netip"
 	"os/exec"
 	"testing"
 
 	"go4.org/mem"
+	"tailscale.com/tstest"
 	"tailscale.com/util/lineiter"
 	"tailscale.com/version"
 )
@@ -114,6 +116,9 @@ func TestFetchRoutingTable(t *testing.T) {
 }
 
 func TestUpdateLastKnownDefaultRouteInterface(t *testing.T) {
+	old := lastKnownDefaultRouteIfName.Load()
+	t.Cleanup(func() { lastKnownDefaultRouteIfName.Store(old) })
+
 	// Pick some interface on the machine
 	interfaces, err := netInterfaces()
 	if err != nil || len(interfaces) == 0 {
@@ -132,5 +137,31 @@ func TestUpdateLastKnownDefaultRouteInterface(t *testing.T) {
 	want, got := ifName, route.InterfaceName
 	if want != got {
 		t.Errorf("OSDefaultRoute() = %q, want %q", got, want)
+	}
+}
+
+func TestDefaultRouteWithdrawal(t *testing.T) {
+	old := lastKnownDefaultRouteIfName.Load()
+	t.Cleanup(func() { lastKnownDefaultRouteIfName.Store(old) })
+	// Both links stay up and numbered throughout the transition.
+	var links []Interface
+	for i, name := range []string{"link1", "link2"} {
+		links = append(links, Interface{
+			Interface: &net.Interface{Name: name, Index: i + 1, Flags: net.FlagUp},
+			AltAddrs:  []net.Addr{&net.IPAddr{IP: net.IPv4(192, 0, 2, byte(i+1))}},
+		})
+	}
+	tstest.Replace(t, &altNetInterfaces, func() ([]Interface, error) { return links, nil })
+
+	for _, want := range []DefaultRouteDetails{
+		{InterfaceName: "link1", InterfaceIndex: 1},
+		{},
+		{InterfaceName: "link2", InterfaceIndex: 2},
+	} {
+		UpdateLastKnownDefaultRouteInterface(want.InterfaceName)
+		got, err := OSDefaultRoute()
+		if got != want || (err != nil) != (want.InterfaceName == "") {
+			t.Fatalf("after %q: OSDefaultRoute() = %+v, %v; want %+v", want.InterfaceName, got, err, want)
+		}
 	}
 }

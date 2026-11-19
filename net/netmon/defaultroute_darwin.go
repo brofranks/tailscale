@@ -18,13 +18,11 @@ var (
 	lastKnownDefaultRouteIfName syncs.AtomicValue[string]
 )
 
-// UpdateLastKnownDefaultRouteInterface is called by ipn-go-bridge from apple network extensions when
-// our NWPathMonitor instance detects a network path transition.
+// UpdateLastKnownDefaultRouteInterface records the default interface reported
+// by an Apple network extension's NWPathMonitor. An empty name clears the hint
+// so defaultRoute can consult the BSD routing table.
 func UpdateLastKnownDefaultRouteInterface(ifName string) {
-	if ifName == "" {
-		return
-	}
-	if old := lastKnownDefaultRouteIfName.Swap(ifName); old != ifName {
+	if old := lastKnownDefaultRouteIfName.Swap(ifName); old != ifName && ifName != "" {
 		interfaces, err := netInterfaces()
 		if err != nil {
 			log.Printf("defaultroute_darwin: UpdateLastKnownDefaultRouteInterface could not get interfaces: %v", err)
