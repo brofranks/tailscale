@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+(($# == 0)) || {
+    echo "usage: scripts/generate" >&2
+    exit 1
+}
+cd -- "$(dirname "$0")/.."
+read -r tag base <upstream
+rm -rf -- source
+
+git -c advice.detachedHead=false clone --quiet --filter=blob:none --no-tags \
+    --single-branch --branch "$tag" https://github.com/tailscale/tailscale.git source
+actual=$(git -C source rev-parse HEAD)
+[[ $actual == "$base" ]] || {
+    echo "$tag is $actual, upstream pins $base" >&2
+    exit 1
+}
+
+while IFS= read -r patch || [[ -n $patch ]]; do
+    set -- "$@" "../patches/$patch"
+done <patches/series
+git -C source am --quiet --no-gpg-sign "$@"
+
+git -C source --no-pager show -s --format="upstream $base%nsource %H%ntree %T"

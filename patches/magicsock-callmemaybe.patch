@@ -1,0 +1,262 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Brody Franks <brody@franks.id.au>
+Date: Sat, 14 Nov 2026 15:51:32 -0800
+Subject: [PATCH] wgengine/magicsock: send CallMeMaybe from discovery rounds
+ without pings
+
+sendDiscoPingsLocked sent a CallMeMaybe only alongside a ping, so a
+round that pinged nothing could leave both peers on DERP. That happened
+when we knew none of the peer's endpoints, or when the peer's own
+CallMeMaybes kept every ping rate-limited.
+
+A round that pings nothing now still sends a CallMeMaybe, at most once
+per discoPingInterval.
+
+Change-Id: I4d0b01d88da1dd7e6b6f44d34f16e9579238999c
+Signed-off-by: Brody Franks <brody@franks.id.au>
+---
+ wgengine/magicsock/endpoint.go       |  15 +++-
+ wgengine/magicsock/endpoint_test.go  | 116 +++++++++++++++++++++++++++
+ wgengine/magicsock/magicsock_test.go |  32 +++++++-
+ 3 files changed, 158 insertions(+), 5 deletions(-)
+
+diff --git a/wgengine/magicsock/endpoint.go b/wgengine/magicsock/endpoint.go
+index f4304fe586f9429c7b7c77ad27d2466f5d1f5096..fc9885292c21e317debaf1d670f4c639ee413b60 100644
+--- a/wgengine/magicsock/endpoint.go
++++ b/wgengine/magicsock/endpoint.go
+@@ -86,6 +86,7 @@ type endpoint struct {
+ 	lastSendExt               mono.Time      // last time there were outgoing packets sent to this peer from an external trigger (e.g. wireguard-go or disco pingCLI)
+ 	lastSendAny               mono.Time      // last time there were outgoing packets sent this peer from any trigger, internal or external to magicsock
+ 	lastFullPing              mono.Time      // last time we pinged all disco or wireguard only endpoints
++	lastCallMeMaybe           mono.Time      // last time we queued CallMeMaybe
+ 	lastUDPRelayPathDiscovery mono.Time      // last time we ran UDP relay path discovery
+ 	derpAddr                  netip.AddrPort // fallback/bootstrap path, if non-zero (non-zero for well-behaved clients)
+ 
+@@ -1448,12 +1449,17 @@ func (de *endpoint) sendDiscoPingsLocked(now mono.Time, sendCallMeMaybe bool) {
+ 		de.startDiscoPingLocked(epAddr{ap: ep}, now, pingDiscovery, 0, nil)
+ 	}
+ 	derpAddr := de.derpAddr
+-	if buildfeatures.HasNATTraversal && sentAny && sendCallMeMaybe && derpAddr.IsValid() {
++	// A round can send no ping because the peer's endpoints are unknown or
++	// incoming CallMeMaybes keep every ping rate-limited. Still send a
++	// CallMeMaybe, unless one went out within discoPingInterval.
++	due := de.lastCallMeMaybe.IsZero() || now.Sub(de.lastCallMeMaybe) >= discoPingInterval
++	if buildfeatures.HasNATTraversal && (sentAny || due) && sendCallMeMaybe && derpAddr.IsValid() {
++		de.lastCallMeMaybe = now
+ 		// Have our magicsock.Conn figure out its STUN endpoint (if
+ 		// it doesn't know already) and then send a CallMeMaybe
+-		// message to our peer via DERP informing them that we've
+-		// sent so our firewall ports are probably open and now
+-		// would be a good time for them to connect.
++		// message to our peer via DERP informing them that now
++		// would be a good time for them to connect. If we sent
++		// pings, our firewall ports are probably open.
+ 		go de.c.enqueueCallMeMaybe(derpAddr, de)
+ 	}
+ }
+@@ -2294,6 +2300,7 @@ func (de *endpoint) resetLocked() {
+ func (de *endpoint) invalidateDiscoPathLocked() {
+ 	de.lastSendExt = 0
+ 	de.lastFullPing = 0
++	de.lastCallMeMaybe = 0
+ 	de.lastUDPRelayPathDiscovery = 0
+ 	for _, es := range de.endpointState {
+ 		es.lastPing = 0
+diff --git a/wgengine/magicsock/endpoint_test.go b/wgengine/magicsock/endpoint_test.go
+index 10c3c10d4b4aadd3ca2a767c0bb9353363ba9136..6fcabd357a75bb157591a51a6dd0f97e544fe35b 100644
+--- a/wgengine/magicsock/endpoint_test.go
++++ b/wgengine/magicsock/endpoint_test.go
+@@ -6,6 +6,7 @@
+ import (
+ 	"fmt"
+ 	"net/netip"
++	"slices"
+ 	"testing"
+ 	"testing/synctest"
+ 	"time"
+@@ -597,6 +598,117 @@ func Test_endpoint_sendDiscoPingsLocked_neverDirectUDP(t *testing.T) {
+ 	}
+ }
+ 
++// Test_endpoint_sendDiscoPingsLocked_callMeMaybe checks the send path
++// with in-memory packet writes, so queued packets and rate boundaries
++// are deterministic.
++func Test_endpoint_sendDiscoPingsLocked_callMeMaybe(t *testing.T) {
++	synctest.Test(t, func(t *testing.T) {
++		lastWrite := time.Now()
++		writes := make(chan derpWriteRequest, 8)
++		c := &Conn{
++			logf:              t.Logf,
++			privateKey:        key.NewNode(),
++			peerMap:           newPeerMap(),
++			discoInfo:         make(map[key.DiscoPublic]*discoInfo),
++			peerLastDerp:      make(map[key.NodePublic]tailcfg.DERPRegionID),
++			lastEndpointsTime: time.Now(),
++			derpMap: &tailcfg.DERPMap{Regions: map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{
++				1: {RegionID: 1},
++			}},
++			activeDerp: map[tailcfg.DERPRegionID]activeDerp{
++				1: {writeCh: writes, lastWrite: &lastWrite},
++			},
++		}
++		c.discoAtomic.Set(key.NewDisco())
++		c.pconn4.setConnLocked(&scriptedPacketConn{}, "udp4", nil)
++		peerDisco := key.NewDisco()
++		de := &endpoint{
++			c:             c,
++			nodeID:        1,
++			publicKey:     key.NewNode().Public(),
++			derpAddr:      netip.AddrPortFrom(tailcfg.DerpMagicIPAddr, 1),
++			sentPing:      make(map[stun.TxID]sentPing),
++			endpointState: make(map[netip.AddrPort]*endpointState),
++		}
++		de.updateDiscoKey(peerDisco.Public())
++		c.peerMap.upsertEndpoint(de, key.DiscoPublic{}, false)
++		// discover runs a discovery round and checks how many CallMeMaybes
++		// the endpoint has queued for the relay so far.
++		var queued []derpWriteRequest
++		discover := func(want int) {
++			t.Helper()
++			de.mu.Lock()
++			de.sendDiscoPingsLocked(mono.Now(), true)
++			de.mu.Unlock()
++			synctest.Wait()
++			for len(writes) > 0 {
++				queued = append(queued, <-writes)
++			}
++			if got := len(queued); got != want {
++				t.Fatalf("queued %d CallMeMaybes, want %d", got, want)
++			}
++		}
++		// With none of the peer's endpoints known, a round pings nothing
++		// and still sends one per interval.
++		discover(1)
++		discover(1)
++		localEPs := []netip.AddrPort{
++			netip.MustParseAddrPort("192.0.2.2:1234"),
++			netip.MustParseAddrPort("[2001:db8::2]:1234"),
++		}
++		c.mu.Lock()
++		for _, ep := range localEPs {
++			c.lastEndpoints = append(c.lastEndpoints, tailcfg.Endpoint{Addr: ep})
++		}
++		c.mu.Unlock()
++		time.Sleep(discoPingInterval - time.Nanosecond)
++		discover(1)
++		time.Sleep(time.Nanosecond)
++		discover(2)
++		// Each CallMeMaybe carries our current endpoints, including an empty
++		// set.
++		for i, want := range [][]netip.AddrPort{nil, localEPs} {
++			clear, ok := peerDisco.Shared(c.discoAtomic.Public()).Open(queued[i].b[len(disco.Magic)+key.DiscoPublicRawLen:])
++			if !ok {
++				t.Fatal("cannot open queued CallMeMaybe")
++			}
++			msg, err := disco.Parse(clear)
++			if err != nil {
++				t.Fatal(err)
++			}
++			if cmm, ok := msg.(*disco.CallMeMaybe); !ok || !slices.Equal(cmm.MyNumber, want) {
++				t.Fatalf("queued message %d = %#v, want CallMeMaybe with endpoints %v", i, msg, want)
++			}
++		}
++		// The peer's CallMeMaybes arrive more often than discoPingInterval,
++		// so every ping is always rate-limited.
++		ep := netip.MustParseAddrPort("192.0.2.1:7")
++		fromPeer := &disco.CallMeMaybe{MyNumber: []netip.AddrPort{ep}}
++		de.handleCallMeMaybe(fromPeer)
++		discover(2)
++		time.Sleep(discoPingInterval - time.Nanosecond)
++		de.handleCallMeMaybe(fromPeer)
++		discover(2)
++		time.Sleep(time.Nanosecond)
++		de.handleCallMeMaybe(fromPeer)
++		discover(3)
++		// A round that pings sends one whatever the interval, and the
++		// interval then runs from that one.
++		time.Sleep(discoPingInterval / 2)
++		de.endpointState[ep].lastPing = 0
++		discover(4)
++		time.Sleep(discoPingInterval / 2)
++		de.handleCallMeMaybe(fromPeer)
++		discover(4)
++		time.Sleep(discoPingInterval/2 - time.Nanosecond)
++		de.handleCallMeMaybe(fromPeer)
++		discover(4)
++		time.Sleep(time.Nanosecond)
++		de.handleCallMeMaybe(fromPeer)
++		discover(5)
++	})
++}
++
+ func Test_endpoint_updateFromNodeAfterDiscoKeyChange(t *testing.T) {
+ 	relayAddr := epAddr{ap: netip.MustParseAddrPort("192.0.2.2:77")}
+ 	relayAddr.vni.Set(1)
+@@ -1240,6 +1352,7 @@ func TestChangedActiveDiscoLocked(t *testing.T) {
+ 		de := &endpoint{}
+ 		de.lastSendExt = mono.Now()
+ 		de.lastFullPing = mono.Now()
++		de.lastCallMeMaybe = mono.Now()
+ 		de.lastUDPRelayPathDiscovery = mono.Now()
+ 		de.isWireguardOnly = true // avoid sentPing iteration, which requires de.c
+ 		de.mu.Lock()
+@@ -1251,6 +1364,9 @@ func TestChangedActiveDiscoLocked(t *testing.T) {
+ 		if de.lastFullPing != 0 {
+ 			t.Error("lastFullPing not reset to zero")
+ 		}
++		if de.lastCallMeMaybe != 0 {
++			t.Error("lastCallMeMaybe not reset to zero")
++		}
+ 		if de.lastUDPRelayPathDiscovery != 0 {
+ 			t.Error("lastUDPRelayPathDiscovery not reset to zero")
+ 		}
+diff --git a/wgengine/magicsock/magicsock_test.go b/wgengine/magicsock/magicsock_test.go
+index f6e1f9981f1e56e805946a4e9820914dac6029fe..2275d2bc240df86dec1bb93c4804fcbc5b616bf4 100644
+--- a/wgengine/magicsock/magicsock_test.go
++++ b/wgengine/magicsock/magicsock_test.go
+@@ -1136,6 +1136,36 @@ func newPinger(t *testing.T, logf logger.Logf, src, dst *magicStack) (cleanup fu
+ // TestActiveDiscovery for the various configurations of devices that
+ // get exercised.
+ func testActiveDiscovery(t *testing.T, d *devices) {
++	t.Helper()
++	for _, tt := range []struct {
++		name    string
++		missing [2]bool
++	}{
++		{name: "neither"},
++		{name: "both", missing: [2]bool{true, true}},
++		{name: "initiator", missing: [2]bool{true, false}},
++		{name: "receiver", missing: [2]bool{false, true}},
++	} {
++		t.Run("missing-endpoints="+tt.name, func(t *testing.T) {
++			testActiveDiscoveryWithEndpoints(t, d, func(idx int, nm *netmap.NetworkMap) {
++				if !tt.missing[idx] {
++					return
++				}
++				for i, peer := range nm.Peers {
++					node := peer.AsStruct()
++					node.Endpoints = nil
++					nm.Peers[i] = node.View()
++				}
++			})
++		})
++	}
++}
++
++func testActiveDiscoveryWithEndpoints(
++	t *testing.T,
++	d *devices,
++	mutateNetmap func(int, *netmap.NetworkMap),
++) {
+ 	tstest.PanicOnLog()
+ 
+ 	tlogf, setT := makeNestable(t)
+@@ -1158,7 +1188,7 @@ func testActiveDiscovery(t *testing.T, d *devices) {
+ 	m2 := newMagicStack(t, logger.WithPrefix(logf, "conn2: "), d.m2, derpMap)
+ 	defer m2.Close()
+ 
+-	cleanup = meshStacks(logf, nil, m1, m2)
++	cleanup = meshStacks(logf, mutateNetmap, m1, m2)
+ 	defer cleanup()
+ 
+ 	m1IP := m1.IP()

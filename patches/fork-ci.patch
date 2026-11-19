@@ -1,0 +1,81 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Brody Franks <brody@franks.id.au>
+Date: Thu, 22 Oct 2026 22:17:50 -0700
+Subject: [PATCH] .github/workflows: run CI on source branches
+
+Pushes to source/* branches, which hold Headwire's generated release
+sources, run the test, vet and natlab-basic workflows before a release
+is tagged. The vet workflow drops its push path filter, so it runs on
+every source push whatever files the patches change.
+
+The Windows job uses ci-windows-github-1 only for its private network
+to cigocached, which the go-cache action already skips when
+CIGOCACHED_AZURE_URL is unset, so run it on windows-2022 elsewhere.
+The Slack notification needs Tailscale's webhook, so it runs only in
+tailscale/tailscale.
+
+Change-Id: Ic61b040e62283683acc668cea5f6044af273ea81
+Signed-off-by: Brody Franks <brody@franks.id.au>
+---
+ .github/workflows/natlab-basic.yml | 1 +
+ .github/workflows/test.yml         | 5 +++--
+ .github/workflows/vet.yml          | 4 +---
+ 3 files changed, 5 insertions(+), 5 deletions(-)
+
+diff --git a/.github/workflows/natlab-basic.yml b/.github/workflows/natlab-basic.yml
+index e53906b717ea742ea3095b9e8e126a8cc386d1bc..9ed84f11b65c47d002856bd2962cc28f84b7d2d3 100644
+--- a/.github/workflows/natlab-basic.yml
++++ b/.github/workflows/natlab-basic.yml
+@@ -12,6 +12,7 @@ on:
+     branches:
+       - "main"
+       - "release-branch/*"
++      - "source/*"
+   pull_request:
+     # all PRs on all branches
+   merge_group:
+diff --git a/.github/workflows/test.yml b/.github/workflows/test.yml
+index 3e877922ffd2c375b303674fd9e0341f5e8aab10..1eea2f940344b3fbf787b55c6ea2e14a99d34a4f 100644
+--- a/.github/workflows/test.yml
++++ b/.github/workflows/test.yml
+@@ -14,6 +14,7 @@ on:
+     branches:
+       - "main"
+       - "release-branch/*"
++      - "source/*"
+   pull_request:
+     # all PRs on all branches
+   merge_group:
+@@ -213,7 +214,7 @@ jobs:
+     # ci-windows-github-1 is a 2022 GitHub-managed runner in our org with 8 cores
+     # and 32 GB of RAM. It is connected to a private Azure VNet that hosts cigocached.
+     # https://github.com/organizations/tailscale/settings/actions/github-hosted-runners/5
+-    runs-on: ci-windows-github-1
++    runs-on: ${{ github.repository == 'tailscale/tailscale' && 'ci-windows-github-1' || 'windows-2022' }}
+     needs: gomod-cache
+     name: Windows (${{ matrix.name || matrix.shard}})
+     strategy:
+@@ -839,7 +840,7 @@ jobs:
+       # all jobs succeeded. A skipped job results in the list staying expanded.
+       # By having the job always run, but skipping its only step as needed, we
+       # let the CI output collapse nicely in PRs.
+-      if: failure() && github.event_name == 'push'
++      if: failure() && github.event_name == 'push' && github.repository == 'tailscale/tailscale'
+       uses: slackapi/slack-github-action@91efab103c0de0a537f72a35f6b8cda0ee76bf0a # v2.1.1
+       with:
+         webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+diff --git a/.github/workflows/vet.yml b/.github/workflows/vet.yml
+index d8f8e98a42658d5dd43181102f8206bc01e05a2c..cfa2b1e3522d2c6554a49a7ace2c527094030a72 100644
+--- a/.github/workflows/vet.yml
++++ b/.github/workflows/vet.yml
+@@ -13,9 +13,7 @@ on:
+     branches:
+       - main
+       - "release-branch/*"
+-    paths:
+-      - .github/workflows/vet.yml
+-      - "**.go"
++      - "source/*"
+   pull_request:
+     paths:
+       - .github/workflows/vet.yml
