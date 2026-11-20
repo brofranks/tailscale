@@ -145,7 +145,9 @@ func newUserspaceRouterAdvanced(logf logger.Logf, tunname string, netMon *netmon
 		ipRuleFixLimiter: rate.NewLimiter(rate.Every(5*time.Second), 10),
 		ipPolicyPrefBase: 5200,
 	}
-	r.interfaceV6Usable = func() bool { return interfaceV6UsableForTun(r.tunname) }
+	r.interfaceV6Usable = func() bool {
+		return interfaceV6UsableForTun("/proc/sys/net/ipv6/conf", r.tunname)
+	}
 	ec := bus.Client("router-linux")
 	r.rulesAddedPub = eventbus.Publish[AddIPRules](ec)
 	eventbus.SubscribeFunc(ec, func(rs netmon.RuleDeleted) {
@@ -384,6 +386,15 @@ func (r *linuxRouter) restoreIPRules() {
 		families = families[:1] // IPv4 is always first.
 	}
 	r.justAddIPRules(families)
+}
+
+// IPv6Available reports whether Up selected IPv6 and the router still
+// considers its backend and tunnel usable for IPv6 addresses and routes.
+// Call it after Up succeeds and before Close.
+func (r *linuxRouter) IPv6Available() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return slices.Contains(r.ruleFamilies, v6) && r.getV6Available()
 }
 
 func (r *linuxRouter) Up() error {
@@ -990,13 +1001,13 @@ func (r *linuxRouter) snapshotV6Usable() func() {
 // once IPv6 is up on the interface (e.g. an MTU below the 1280-byte IPv6
 // minimum removes it entirely), and disable_ipv6 within it reflects whether
 // IPv6 has since been turned off explicitly.
-func interfaceV6UsableForTun(tunname string) bool {
+func interfaceV6UsableForTun(confDir, tunname string) bool {
 	if tunname == "" {
 		return false
 	}
 	// Open under conf/ with os.OpenInRoot so a "../" or symlink in tunname can't
 	// escape the directory.
-	f, err := os.OpenInRoot("/proc/sys/net/ipv6/conf", filepath.Join(tunname, "disable_ipv6"))
+	f, err := os.OpenInRoot(confDir, filepath.Join(tunname, "disable_ipv6"))
 	if err != nil {
 		// A missing directory/knob means IPv6 isn't up on the interface, so it's
 		// unavailable. Any other error (e.g. EACCES, or tunname escaping the
@@ -1009,11 +1020,11 @@ func interfaceV6UsableForTun(tunname string) bool {
 	if err != nil {
 		return true // couldn't read; assume usable
 	}
-	disabled, err := strconv.ParseBool(strings.TrimSpace(string(bs)))
+	disabled, err := strconv.Atoi(strings.TrimSpace(string(bs)))
 	if err != nil {
 		return true // unparseable; assume usable
 	}
-	return !disabled
+	return disabled == 0
 }
 
 // addAddress adds an IP/mask to the tunnel interface. Fails if the
