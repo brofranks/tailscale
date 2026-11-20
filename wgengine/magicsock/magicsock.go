@@ -659,18 +659,25 @@ func NewConn(opts Options) (*Conn, error) {
 	c.testOnlyPacketListener = opts.TestOnlyPacketListener
 	c.onDERPRecv = opts.OnDERPRecv
 
-	// Set up publishers and subscribers. Subscribe calls must return before
-	// NewConn otherwise published events can be missed.
 	ec := c.eventBus.Client("magicsock.Conn")
 	c.eventClient = ec
 	c.allocRelayEndpointPub = eventbus.Publish[UDPRelayAllocReq](ec)
 	c.portUpdatePub = eventbus.Publish[router.PortUpdate](ec)
 	c.homeDERPChangedPub = eventbus.Publish[HomeDERPChanged](ec)
-	if buildfeatures.HasPortMapper {
-		eventbus.SubscribeFunc(ec, c.onPortMapChanged)
-	}
-	if buildfeatures.HasNATTraversal {
-		eventbus.SubscribeFunc(ec, c.onUDPRelayAllocResp)
+
+	c.netMon = opts.NetMon
+	c.health = opts.HealthTracker
+	c.extraRootCAs = opts.ExtraRootCAs
+	c.derpAppName = opts.DERPAppName
+	c.getPeerByKey = opts.PeerByKeyFunc
+
+	if err := c.rebind(keepCurrentPort); err != nil {
+		// Close would also unregister metrics shared with other Conns.
+		ec.Close()
+		if closeErr := c.pconn6.Close(); closeErr != nil {
+			err = errors.Join(err, closeErr)
+		}
+		return nil, err
 	}
 
 	c.connCtx, c.connCtxCancel = context.WithCancel(context.Background())
@@ -688,6 +695,7 @@ func NewConn(opts Options) (*Conn, error) {
 		newPortMapper, ok := portmappertype.HookNewPortMapper.GetOk()
 		if ok {
 			c.portMapper = newPortMapper(portmapperLogf, opts.EventBus, opts.NetMon, disableUPnP, c.onlyTCP443.Load)
+			c.portMapper.SetLocalPort(c.LocalPort())
 		}
 		// If !ok, the HookNewPortMapper hook is not set (so feature/portmapper
 		// isn't linked), but the build tag to explicitly omit the portmapper
@@ -695,16 +703,6 @@ func NewConn(opts Options) (*Conn, error) {
 		// the portmapper is a no-op even if linked (but it's no longer linked,
 		// since the move to feature/portmapper), or if people are wiring up
 		// their own Tailscale build from pieces.
-	}
-
-	c.netMon = opts.NetMon
-	c.health = opts.HealthTracker
-	c.extraRootCAs = opts.ExtraRootCAs
-	c.derpAppName = opts.DERPAppName
-	c.getPeerByKey = opts.PeerByKeyFunc
-
-	if err := c.rebind(keepCurrentPort); err != nil {
-		return nil, err
 	}
 
 	c.netChecker = &netcheck.Client{
@@ -734,6 +732,15 @@ func NewConn(opts Options) (*Conn, error) {
 		} else if !errors.Is(err, errors.ErrUnsupported) {
 			c.logf("[v1] couldn't create raw v6 disco listener, using regular listener instead: %v", err)
 		}
+	}
+
+	// Event handlers may use the Conn as soon as they subscribe. Subscribe
+	// before returning so callers can publish events immediately.
+	if buildfeatures.HasPortMapper {
+		eventbus.SubscribeFunc(ec, c.onPortMapChanged)
+	}
+	if buildfeatures.HasNATTraversal {
+		eventbus.SubscribeFunc(ec, c.onUDPRelayAllocResp)
 	}
 
 	c.logf("magicsock: disco key = %v", c.discoAtomic.Short())

@@ -451,7 +451,7 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error) 
 	var err error
 	e.magicConn, err = magicsock.NewConn(magicsockOpts)
 	if err != nil {
-		return nil, fmt.Errorf("wgengine: %v", err)
+		return nil, fmt.Errorf("wgengine: %w", err)
 	}
 	closePool.add(e.magicConn.Close)
 	e.magicConn.SetNetworkUp(e.netMon.InterfaceState().AnyInterfaceUp())
