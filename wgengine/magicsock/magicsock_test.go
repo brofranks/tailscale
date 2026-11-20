@@ -47,6 +47,7 @@ import (
 	"tailscale.com/derp/derpserver"
 	"tailscale.com/disco"
 	"tailscale.com/envknob"
+	"tailscale.com/feature/buildfeatures"
 	"tailscale.com/health"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/net/batching"
@@ -55,6 +56,7 @@ import (
 	"tailscale.com/net/netmon"
 	"tailscale.com/net/packet"
 	"tailscale.com/net/ping"
+	"tailscale.com/net/portmapper/portmappertype"
 	"tailscale.com/net/routemanager"
 	"tailscale.com/net/stun"
 	"tailscale.com/net/stun/stuntest"
@@ -4961,6 +4963,154 @@ func TestUpsertPeerTSMPKeyPreservedOnControlUpdate(t *testing.T) {
 	}
 	if conn.peerMap.knownPeerDiscoKey(dk1) {
 		t.Error("control key dk1 shoud not be in peermap")
+	}
+}
+
+type packetListenerFunc func(context.Context, string, string) (net.PacketConn, error)
+
+func (f packetListenerFunc) ListenPacket(ctx context.Context, network, address string) (net.PacketConn, error) {
+	return f(ctx, network, address)
+}
+
+func TestNewConnBindFailureReleasesIPv6(t *testing.T) {
+	if !hasUDPTransport {
+		t.Skip("requires UDP peer transport")
+	}
+	_, loopback, err := netmon.LocalAddresses()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(loopback, netip.IPv6Loopback()) {
+		t.Skip("no IPv6 loopback address")
+	}
+	envknob.SetenvForTest(t, "TS_DEBUG_ALWAYS_USE_DERP", "false")
+	for _, preclosed := range []bool{false, true} {
+		t.Run(fmt.Sprintf("preclosed=%t", preclosed), func(t *testing.T) {
+			bus := eventbustest.NewBus(t)
+			var ipv6 net.PacketConn
+			listen := func(ctx context.Context, network, address string) (net.PacketConn, error) {
+				if network == "udp6" {
+					pc, err := (localhostListener{}).ListenPacket(ctx, network, address)
+					if err != nil {
+						t.Fatal(err)
+					}
+					ipv6 = pc
+					t.Cleanup(func() { pc.Close() })
+					return pc, nil
+				}
+				if ipv6 == nil {
+					t.Fatal("no IPv6 socket to roll back")
+				}
+				if preclosed {
+					if err := ipv6.Close(); err != nil {
+						t.Fatal(err)
+					}
+				}
+				return nil, errors.New("udp4 unavailable")
+			}
+			conn, err := NewConn(Options{
+				Logf:                   t.Logf,
+				NetMon:                 netmon.NewStatic(),
+				EventBus:               bus,
+				HealthTracker:          health.NewTracker(bus),
+				DisablePortMapper:      true,
+				TestOnlyPacketListener: packetListenerFunc(listen),
+			})
+			if err == nil {
+				conn.Close()
+				t.Fatal("NewConn succeeded without IPv4")
+			}
+			if !strings.HasPrefix(err.Error(), "magicsock: Rebind IPv4 failed:") || errors.Is(err, net.ErrClosed) != preclosed {
+				t.Fatalf("unexpected bind error: %v", err)
+			}
+			addr := ipv6.LocalAddr().(*net.UDPAddr)
+			rebound, err := net.ListenUDP("udp6", addr)
+			if err != nil {
+				t.Fatalf("rebinding %v: %v", addr, err)
+			}
+			rebound.Close()
+		})
+	}
+}
+
+type recordingPortMapper struct {
+	portmappertype.Client
+	ports []uint16
+}
+
+func (m *recordingPortMapper) SetLocalPort(port uint16) { m.ports = append(m.ports, port) }
+func (m *recordingPortMapper) Close() error             { return nil }
+
+func TestNewConnBindRetry(t *testing.T) {
+	if !hasUDPTransport {
+		t.Skip("requires UDP peer transport")
+	}
+	envknob.SetenvForTest(t, "TS_DEBUG_ALWAYS_USE_DERP", "false")
+	bus := eventbustest.NewBus(t)
+	mon, err := netmon.New(bus, t.Logf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mon.Close()
+	ec := bus.Client("test")
+	defer ec.Close()
+	mapping := eventbus.Publish[portmappertype.Mapping](ec)
+	relay := eventbus.Publish[UDPRelayAllocResp](ec)
+	var mapper *recordingPortMapper
+	newMapper := func(logger.Logf, *eventbus.Bus, *netmon.Monitor, func() bool, func() bool) portmappertype.Client {
+		mapper = new(recordingPortMapper)
+		return mapper
+	}
+	defer portmappertype.HookNewPortMapper.SetForTest(newMapper)()
+	opts := Options{
+		NetMon:        mon,
+		EventBus:      bus,
+		HealthTracker: health.NewTracker(bus),
+		Metrics:       new(usermetric.Registry),
+		Logf:          t.Logf,
+		TestOnlyPacketListener: packetListenerFunc(func(context.Context, string, string) (net.PacketConn, error) {
+			if mapping.ShouldPublish() || relay.ShouldPublish() {
+				t.Error("Conn subscribed to incoming events before binding")
+			}
+			return nil, errors.New("UDP unavailable")
+		}),
+	}
+	if conn, err := NewConn(opts); err == nil {
+		conn.Close()
+		t.Fatal("NewConn succeeded without UDP")
+	}
+	if mapper != nil {
+		t.Fatal("NewConn created a port mapper before binding")
+	}
+	for _, client := range bus.Debugger().Clients() {
+		if client.Name() == "magicsock.Conn" {
+			select {
+			case <-client.Done():
+			default:
+				t.Fatal("failed NewConn left its event client open")
+			}
+		}
+	}
+
+	// Retry immediately on the same monitor and bus.
+	opts.TestOnlyPacketListener = new(natlab.Machine)
+	conn, err := NewConn(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if mapping.ShouldPublish() != buildfeatures.HasPortMapper || relay.ShouldPublish() != buildfeatures.HasNATTraversal {
+		t.Error("missing event subscription after NewConn")
+	}
+	if buildfeatures.HasPortMapper {
+		if mapper == nil || conn.netChecker.PortMapper != mapper {
+			t.Fatal("netcheck did not receive the port mapper")
+		}
+		firstPort := conn.LocalPort()
+		conn.SetPreferredPort(12345)
+		if want := []uint16{firstPort, 12345}; firstPort == 0 || !slices.Equal(mapper.ports, want) {
+			t.Errorf("ports reported to mapper = %v, want %v", mapper.ports, want)
+		}
 	}
 }
 
