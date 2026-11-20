@@ -9,7 +9,6 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
-	"io"
 	"math"
 	"net/netip"
 	"runtime"
@@ -306,7 +305,8 @@ func NewFakeUserspaceEngine(logf logger.Logf, opts ...any) (Engine, error) {
 }
 
 // NewUserspaceEngine creates the named tun device and returns a
-// Tailscale Engine running on it.
+// Tailscale Engine running on it. On failure it returns the startup error
+// joined with any errors from cleanup.
 func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error) {
 	var closePool closeOnErrorPool
 	defer closePool.closeAllIfError(&reterr)
@@ -327,6 +327,9 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error) 
 		logf("[v1] using fake (no-op) OS network configurator")
 		conf.Router = router.NewFake(logf)
 	}
+	// The engine owns the router from here on. The pool closes in order, so
+	// the router is taken down before the device, as Close does.
+	closePool.add(conf.Router.Close)
 	if conf.DNS == nil {
 		logf("[v1] using fake (no-op) DNS configurator")
 		d, err := dns.NewNoopManager()
@@ -348,7 +351,7 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error) 
 	} else {
 		tsTUNDev = tstun.Wrap(logf, conf.Tun, conf.Metrics, conf.EventBus)
 	}
-	closePool.add(tsTUNDev)
+	closePool.add(tsTUNDev.Close)
 
 	rtr := conf.Router
 	if version.IsMobile() {
@@ -391,6 +394,7 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error) 
 		if err != nil {
 			return nil, err
 		}
+		closePool.addNoError(bird.Close)
 		e.bird = bird
 	}
 	e.isLocalAddr.Store(ipset.FalseContainsIPFunc())
@@ -403,7 +407,7 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error) 
 		if err != nil {
 			return nil, err
 		}
-		closePool.add(mon)
+		closePool.add(mon.Close)
 		e.netMon = mon
 		e.netMonOwned = true
 	}
@@ -413,6 +417,7 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error) 
 	conf.Dialer.SetNetMon(e.netMon)
 	conf.Dialer.SetBus(e.eventBus)
 	e.dns = dns.NewManager(logf, conf.DNS, e.health, conf.Dialer, fwdDNSLinkSelector{e, tunName}, conf.ControlKnobs, runtime.GOOS, e.eventBus)
+	closePool.add(e.dns.Down)
 
 	// TODO: there's probably a better place for this
 	sockstats.SetNetMon(e.netMon)
@@ -448,7 +453,7 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error) 
 	if err != nil {
 		return nil, fmt.Errorf("wgengine: %v", err)
 	}
-	closePool.add(e.magicConn)
+	closePool.add(e.magicConn.Close)
 	e.magicConn.SetNetworkUp(e.netMon.InterfaceState().AnyInterfaceUp())
 
 	if newNetLogger, ok := HookNewNetLogger.GetOk(); ok {
@@ -517,12 +522,7 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error) 
 	// wgdev takes ownership of tundev, will close it when closed.
 	e.logf("Creating WireGuard device...")
 	e.wgdev = wgcfg.NewDevice(e.tundev, e.magicConn.Bind(), e.wgLogger.DeviceLogger)
-	closePool.addFunc(e.wgdev.Close)
-	closePool.addFunc(func() {
-		if err := e.magicConn.Close(); err != nil {
-			e.logf("error closing magicconn: %v", err)
-		}
-	})
+	closePool.addNoError(e.wgdev.Close)
 
 	go func() {
 		up := false
@@ -537,21 +537,6 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error) 
 				e.RequestStatus()
 				up = false
 			}
-		}
-	}()
-
-	go func() {
-		select {
-		case <-e.wgdev.Wait():
-			e.mu.Lock()
-			closing := e.closing
-			e.mu.Unlock()
-			if !closing {
-				e.logf("Closing the engine because the WireGuard device has been closed...")
-				e.Close()
-			}
-		case <-e.waitCh:
-			// continue
 		}
 	}()
 
@@ -623,6 +608,22 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error) 
 		e.magicConn.HandleDiscoKeyAdvertisement(peer.Node, pkt)
 	})
 	e.eventClient = ec
+	// Close needs a fully built engine, so the watcher starts only once
+	// nothing can fail and the pool will not close the device.
+	go func() {
+		select {
+		case <-e.wgdev.Wait():
+			e.mu.Lock()
+			closing := e.closing
+			e.mu.Unlock()
+			if !closing {
+				e.logf("Closing the engine because the WireGuard device has been closed...")
+				e.Close()
+			}
+		case <-e.waitCh:
+			// continue
+		}
+	}()
 	e.logf("Engine created.")
 	return e, nil
 }
@@ -1467,15 +1468,31 @@ func (e *userspaceEngine) peerForIP(ip netip.Addr) (ret PeerForIP, ok bool) {
 	return ret, false
 }
 
-type closeOnErrorPool []func()
+type closeOnErrorPool []func() error
 
-func (p *closeOnErrorPool) add(c io.Closer)   { *p = append(*p, func() { c.Close() }) }
-func (p *closeOnErrorPool) addFunc(fn func()) { *p = append(*p, fn) }
-func (p closeOnErrorPool) closeAllIfError(errp *error) {
-	if *errp != nil {
-		for _, closeFn := range p {
-			closeFn()
+func (p *closeOnErrorPool) add(fn func() error) { *p = append(*p, fn) }
+
+func (p *closeOnErrorPool) addNoError(fn func()) {
+	p.add(func() error {
+		fn()
+		return nil
+	})
+}
+
+// closeAllIfError takes a pointer so that a call deferred while the pool is
+// empty still closes what is added later.
+func (p *closeOnErrorPool) closeAllIfError(errp *error) {
+	if *errp == nil {
+		return
+	}
+	errs := []error{*errp}
+	for _, closeFn := range *p {
+		if err := closeFn(); err != nil {
+			errs = append(errs, err)
 		}
+	}
+	if len(errs) > 1 {
+		*errp = errors.Join(errs...)
 	}
 }
 

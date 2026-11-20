@@ -34,7 +34,8 @@ func init() {
 type freebsdRouter struct {
 	*userspaceBSDRouter
 	kernelSubnets    bool // kernel, not netstack, forwards subnet traffic
-	snatSubnetRoutes bool // PF NAT rules are installed
+	snatSubnetRoutes bool // last requested SNAT setting
+	pfNeedsCleanup   bool // this router owns cleanup for an attempted anchor load
 }
 
 func newFreeBSDRouter(logf logger.Logf, tundev tun.Device, netMon *netmon.Monitor, health *health.Tracker) (router.Router, error) {
@@ -82,10 +83,12 @@ func (r *freebsdRouter) Set(cfg *router.Config) (reterr error) {
 			r.logf("adding PF NAT rules: %v", err)
 			setErr(err)
 		}
-	default:
+	case r.pfNeedsCleanup:
 		if err := r.delPFNATRules(); err != nil {
 			r.logf("removing PF NAT rules: %v", err)
 			setErr(err)
+		} else {
+			r.pfNeedsCleanup = false
 		}
 	}
 	r.snatSubnetRoutes = wantSNAT
@@ -109,6 +112,8 @@ func (r *freebsdRouter) enableIPForwarding() {
 // configuration; we only ever flush or modify rules inside this anchor.
 const pfAnchorName = "tailscale"
 
+var pfListInterfaces = net.Interfaces
+
 // addPFNATRules configures PF to masquerade traffic from Tailscale addresses
 // leaving via non-Tailscale interfaces. This is the FreeBSD equivalent of the
 // Linux iptables MASQUERADE rule used for subnet routing.
@@ -121,13 +126,6 @@ func (r *freebsdRouter) addPFNATRules() error {
 
 	// Enable PF (idempotent; returns error if already enabled).
 	cmd("pfctl", "-e").CombinedOutput()
-
-	// Ensure the main ruleset references our anchor so PF evaluates it.
-	// We add both a nat-anchor (for NAT rules) and an anchor (for filter
-	// rules, currently just "pass" to avoid blocking) if not already present.
-	if err := ensurePFAnchorRef(); err != nil {
-		return fmt.Errorf("ensuring PF anchor reference: %w", err)
-	}
 
 	// Load rules into the tailscale anchor.
 	// Traffic from Tailscale CGNAT (100.64.0.0/10) or ULA (fd7a:115c:a1e0::/48)
@@ -148,8 +146,16 @@ func (r *freebsdRouter) addPFNATRules() error {
 		return fmt.Errorf("building PF NAT rules: %w", err)
 	}
 
+	// Ensure the main ruleset references our anchor so PF evaluates it.
+	// We add both a nat-anchor (for NAT rules) and an anchor (for filter
+	// rules, currently just "pass" to avoid blocking) if not already present.
+	if err := ensurePFAnchorRef(); err != nil {
+		return fmt.Errorf("ensuring PF anchor reference: %w", err)
+	}
+
 	pfctl := exec.Command("pfctl", "-a", pfAnchorName, "-f", "-")
 	pfctl.Stdin = strings.NewReader(rules)
+	r.pfNeedsCleanup = true
 	out, err := pfctl.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("pfctl -a %s -f: %v (%s)", pfAnchorName, err, strings.TrimSpace(string(out)))
@@ -166,7 +172,7 @@ func (r *freebsdRouter) addPFNATRules() error {
 // The interface set is sampled when SNAT is enabled; interfaces added later
 // are not covered until SNAT is toggled or tailscaled restarts.
 func (r *freebsdRouter) buildPFNATRules() (string, error) {
-	ifaces, err := net.Interfaces()
+	ifaces, err := pfListInterfaces()
 	if err != nil {
 		return "", err
 	}
@@ -369,7 +375,10 @@ func (r *freebsdRouter) Close() error {
 	// Don't destroy the interface here: this process still holds the tun
 	// open, and FreeBSD's tun(4) blocks destroy until the last close, which
 	// deadlocks shutdown. The next startup's cleanUp destroys leftovers.
-	cleanUpPF(r.logf)
+	if r.pfNeedsCleanup {
+		r.pfNeedsCleanup = false
+		cleanUpPF(r.logf)
+	}
 	return nil
 }
 

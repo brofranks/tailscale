@@ -109,7 +109,7 @@ func hasDefaultRoute(routes []netip.Prefix) bool {
 }
 
 func (r *winRouter) Close() error {
-	r.firewall.clear()
+	r.firewall.clearIfUsed()
 
 	if r.routeChangeCallback != nil {
 		r.routeChangeCallback.Unregister()
@@ -161,6 +161,16 @@ type firewallTweaker struct {
 
 func (ft *firewallTweaker) clear() { ft.set(nil, nil, nil) }
 
+// clearIfUsed only schedules a reset if this router has requested firewall
+// work. Starting a fresh worker would replace the host's inbound rules.
+func (ft *firewallTweaker) clearIfUsed() {
+	ft.mu.Lock()
+	defer ft.mu.Unlock()
+	if ft.running || ft.known {
+		ft.setLocked(nil, nil, nil)
+	}
+}
+
 // set takes CIDRs to allow, and the routes that point into the Tailscale tun interface.
 // Empty slices remove firewall rules.
 //
@@ -168,7 +178,10 @@ func (ft *firewallTweaker) clear() { ft.set(nil, nil, nil) }
 func (ft *firewallTweaker) set(cidrs []string, routes, localRoutes []netip.Prefix) {
 	ft.mu.Lock()
 	defer ft.mu.Unlock()
+	ft.setLocked(cidrs, routes, localRoutes)
+}
 
+func (ft *firewallTweaker) setLocked(cidrs []string, routes, localRoutes []netip.Prefix) {
 	if len(cidrs) == 0 {
 		ft.logf("marking for removal")
 	} else {
