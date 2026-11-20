@@ -11,6 +11,7 @@ import (
 	"slices"
 	"testing"
 
+	"go4.org/netipx"
 	"tailscale.com/tstest"
 )
 
@@ -125,6 +126,50 @@ func TestLikelyHomeRouterIP(t *testing.T) {
 			t.Fatal("expected no success")
 		}
 	})
+}
+
+func TestLocalAddressesCGNAT(t *testing.T) {
+	oldName, oldIndex := tsIfProps.tsIfName(), tsIfProps.tsIfIndex()
+	t.Cleanup(func() { tsIfProps.set(oldName, oldIndex) })
+
+	iface := func(name string, ip netip.Addr) Interface {
+		return Interface{
+			Interface: &net.Interface{Name: name, Flags: net.FlagUp},
+			AltAddrs:  []net.Addr{netipx.AddrIPNet(ip)},
+		}
+	}
+	lan := netip.MustParseAddr("100.70.1.9")
+	otherVPN := netip.MustParseAddr("100.82.2.3")
+	chromeOS := netip.MustParseAddr("100.115.92.1")
+	ula := iface("lan6", netip.MustParseAddr("fd7a:115c:a1e0:2::9"))
+	mixed := []Interface{
+		iface("lan", lan),
+		iface("wg0", netip.MustParseAddr("100.70.1.10")),
+		iface("tailscale0", otherVPN),
+		iface("arc0", chromeOS),
+		ula,
+	}
+	for _, tc := range []struct {
+		name, registered string
+		ifaces           []Interface
+		want             []netip.Addr
+	}{
+		{"unregistered", "", mixed, []netip.Addr{chromeOS}},
+		{"registered", "wg0", mixed, []netip.Addr{lan, otherVPN, chromeOS}},
+		{"registered-ULA-only", "wg0", []Interface{ula}, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tsIfProps.set(tc.registered, 0)
+			tstest.Replace(t, &altNetInterfaces, func() ([]Interface, error) { return tc.ifaces, nil })
+			got, _, err := LocalAddresses()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !slices.Equal(got, tc.want) {
+				t.Errorf("LocalAddresses = %v, want %v", got, tc.want)
+			}
+		})
+	}
 }
 
 func TestLocalAddressesSkipsTailscaleInterface(t *testing.T) {

@@ -89,12 +89,9 @@ func LocalAddresses() (regular, loopback []netip.Addr, err error) {
 					continue
 				}
 				ip = ip.Unmap()
-				// TODO(apenwarr): don't special case cgNAT.
-				// In the general wireguard case, it might
-				// very well be something we can route to
-				// directly, because both nodes are
-				// behind the same CGNAT router.
-				if tsaddr.IsTailscaleIP(ip) {
+				// Once the tunnel is identified by name, CGNAT IPv4 addresses
+				// on other interfaces are candidates for a direct path.
+				if tsaddr.IsTailscaleIP(ip) && (tsIfName == "" || ip.Is6()) {
 					continue
 				}
 				if ip.IsLoopback() || ifcIsLoopback {
