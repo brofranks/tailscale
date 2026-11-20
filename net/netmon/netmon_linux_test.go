@@ -99,3 +99,37 @@ func TestIgnoreDuplicateNEWADDR(t *testing.T) {
 		}
 	})
 }
+
+func TestTunnelAddressEvents(t *testing.T) {
+	oldName, oldIndex := tsIfProps.tsIfName(), tsIfProps.tsIfIndex()
+	t.Cleanup(func() { tsIfProps.set(oldName, oldIndex) })
+
+	for _, tc := range []struct {
+		registered int
+		ifIndex    uint32
+		wantIgnore bool
+	}{
+		{0, 7, false},
+		{7, 7, true},
+		{7, 8, false},
+	} {
+		tsIfProps.set("wg0", tc.registered)
+		c := nlConn{
+			logf:      t.Logf,
+			addrCache: make(map[uint32]map[netip.Addr]bool),
+		}
+		for _, addr := range []string{"100.70.1.4", "10.22.3.5", "fd7a:115c:a1e0::9"} {
+			for _, typ := range []netlink.HeaderType{unix.RTM_NEWADDR, unix.RTM_DELADDR} {
+				c.buffered = []netlink.Message{newAddrMsg(tc.ifIndex, addr, typ)}
+				msg, err := c.Receive()
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got := msg.ignore(); got != tc.wantIgnore {
+					t.Errorf("registered=%d ifIndex=%d type=%d addr=%s: ignore=%v, want %v",
+						tc.registered, tc.ifIndex, typ, addr, got, tc.wantIgnore)
+				}
+			}
+		}
+	}
+}
