@@ -71,8 +71,10 @@ import (
 	"tailscale.com/types/netlogtype"
 	"tailscale.com/types/netmap"
 	"tailscale.com/types/nettype"
+	"tailscale.com/types/views"
 	"tailscale.com/util/cibuild"
 	"tailscale.com/util/clientmetric"
+	"tailscale.com/util/cloudinfo"
 	"tailscale.com/util/eventbus"
 	"tailscale.com/util/eventbus/eventbustest"
 	"tailscale.com/util/mak"
@@ -1365,10 +1367,12 @@ func testTwoDevicePing(t *testing.T, d *devices) {
 	addrPort := netip.MustParseAddrPort
 	m1Conns := []netlogtype.Connection{
 		{Src: addrPort("1.0.0.2:0"), Dst: m2.conn.pconn4.LocalAddr().AddrPort()},
+		{Src: addrPort("1.0.0.2:0"), Dst: m2.conn.pconn6.LocalAddr().AddrPort()},
 		{Src: addrPort("1.0.0.2:0"), Dst: addrPort("127.3.3.40:1")},
 	}
 	m2Conns := []netlogtype.Connection{
 		{Src: addrPort("1.0.0.1:0"), Dst: m1.conn.pconn4.LocalAddr().AddrPort()},
+		{Src: addrPort("1.0.0.1:0"), Dst: m1.conn.pconn6.LocalAddr().AddrPort()},
 		{Src: addrPort("1.0.0.1:0"), Dst: addrPort("127.3.3.40:1")},
 	}
 
@@ -5010,4 +5014,123 @@ func TestUnambiguousNodeKeyOfPingLocked(t *testing.T) {
 			t.Errorf("expected match, got mismatch, nodekey: %v", nk)
 		}
 	})
+}
+
+type localEndpointTestSocket struct {
+	*blockForeverConn
+	addr string
+}
+
+func (s localEndpointTestSocket) LocalAddr() net.Addr {
+	if s.addr == "" {
+		return new(net.UDPAddr)
+	}
+	return net.UDPAddrFromAddrPort(netip.MustParseAddrPort(s.addr))
+}
+
+func TestLocalEndpointPorts(t *testing.T) {
+	ip4 := netip.MustParseAddr("192.0.2.9")
+	ip6 := netip.MustParseAddr("2001:db8::9")
+	host := func(ip netip.Addr) net.Addr {
+		return &net.IPNet{IP: ip.AsSlice(), Mask: net.CIDRMask(ip.BitLen(), ip.BitLen())}
+	}
+	lan := netmon.Interface{
+		Interface: &net.Interface{Name: "lan", Flags: net.FlagUp},
+		AltAddrs:  []net.Addr{host(ip4), host(ip6)},
+	}
+	lo := netmon.Interface{Interface: &net.Interface{Name: "lo", Flags: net.FlagUp | net.FlagLoopback},
+		AltAddrs: []net.Addr{host(netip.MustParseAddr("127.0.0.1")), host(netip.IPv6Loopback())}}
+	ifs := []netmon.Interface{lan, lo}
+	netmon.RegisterInterfaceGetter(func() ([]netmon.Interface, error) { return ifs, nil })
+	t.Cleanup(func() { netmon.RegisterInterfaceGetter(nil) })
+	t.Run("advertised-ports", func(t *testing.T) {
+		if !hasUDPTransport {
+			t.Skip("requires UDP transport")
+		}
+		c := Conn{
+			logf:      t.Logf,
+			cloudInfo: new(cloudinfo.CloudInfo),
+		}
+		c.pconn4.pconn = localEndpointTestSocket{addr: "0.0.0.0:40101"}
+		c.pconn6.pconn = localEndpointTestSocket{addr: "[::]:40202"}
+		got, err := c.determineEndpoints(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := []tailcfg.Endpoint{
+			{Addr: netip.AddrPortFrom(ip4, 40101), Type: tailcfg.EndpointLocal},
+			{Addr: netip.AddrPortFrom(ip6, 40202), Type: tailcfg.EndpointLocal},
+		}
+		if !slices.Equal(got, want) {
+			t.Errorf("advertised endpoints = %v, want %v", got, want)
+		}
+	})
+
+	for _, tc := range []struct {
+		name               string
+		v4, v6             string
+		offline, haveOther bool
+		want               []string
+	}{
+		{"separate-ports", "0.0.0.0:40101", "[::]:40202", false, false, []string{
+			"192.0.2.9:40101",
+			"[2001:db8::9]:40202",
+		}},
+		{"fixed-v4", "192.0.2.8:40101", "[::]:40202", false, false, []string{"192.0.2.8:40101", "[2001:db8::9]:40202"}},
+		{"fixed-v6", "0.0.0.0:40101", "[2001:db8::8]:40202", false, false, []string{
+			"192.0.2.9:40101",
+			"[2001:db8::8]:40202",
+		}},
+		{"missing-v4", "", "[::]:40202", false, false, []string{"[2001:db8::9]:40202"}},
+		{"missing-v6", "0.0.0.0:40101", "", false, false, []string{"192.0.2.9:40101"}},
+		{"offline", "0.0.0.0:40101", "[::]:40202", true, false, []string{"127.0.0.1:40101", "[::1]:40202"}},
+		{"public-endpoint", "0.0.0.0:40101", "[::]:40202", true, true, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.offline {
+				ifs = []netmon.Interface{lo}
+			} else {
+				ifs = []netmon.Interface{lan, lo}
+			}
+			var c Conn
+			c.pconn4.pconn = localEndpointTestSocket{addr: tc.v4}
+			c.pconn6.pconn = localEndpointTestSocket{addr: tc.v6}
+			got, err := c.localEndpoints(tc.haveOther)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var ss []string
+			for _, ep := range got {
+				ss = append(ss, ep.String())
+			}
+			slices.Sort(ss)
+			if !slices.Equal(ss, tc.want) {
+				t.Errorf("local endpoints = %v, want %v", ss, tc.want)
+			}
+		})
+	}
+}
+
+func TestDetermineEndpointsInterfaceError(t *testing.T) {
+	if !hasUDPTransport {
+		t.Skip("requires UDP transport")
+	}
+	lookupErr := errors.New("interface inventory unavailable")
+	netmon.RegisterInterfaceGetter(func() ([]netmon.Interface, error) { return nil, lookupErr })
+	t.Cleanup(func() { netmon.RegisterInterfaceGetter(nil) })
+
+	c := Conn{
+		logf:            t.Logf,
+		cloudInfo:       new(cloudinfo.CloudInfo),
+		staticEndpoints: views.SliceOf(eps("192.0.2.100:40404")),
+	}
+	c.pconn4.pconn = localEndpointTestSocket{addr: "0.0.0.0:40101"}
+	c.pconn6.pconn = localEndpointTestSocket{addr: "[::]:40202"}
+	got, err := c.determineEndpoints(t.Context())
+	if !errors.Is(err, lookupErr) {
+		t.Errorf("determineEndpoints error = %v, want %v", err, lookupErr)
+	}
+	if len(got) != 0 {
+		t.Errorf("advertised endpoints = %v, want none", got)
+	}
 }
