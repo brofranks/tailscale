@@ -15,16 +15,20 @@ import (
 	"runtime"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/tailscale/wireguard-go/device"
+	"github.com/tailscale/wireguard-go/tun"
+	"github.com/tailscale/wireguard-go/tun/tuntest"
 	"go4.org/mem"
 	"tailscale.com/cmd/testwrapper/flakytest"
 	"tailscale.com/control/controlknobs"
 	"tailscale.com/derp"
 	"tailscale.com/derp/derpserver"
 	"tailscale.com/envknob"
+	"tailscale.com/feature/buildfeatures"
 	"tailscale.com/health"
 	"tailscale.com/net/dns"
 	"tailscale.com/net/dns/resolver"
@@ -132,6 +136,138 @@ type failingRouter struct {
 func (failingRouter) Up() error                  { return nil }
 func (r failingRouter) Set(*router.Config) error { return r.err }
 func (failingRouter) Close() error               { return nil }
+
+// closeCountingRouter is a failingRouter that counts its Close calls.
+type closeCountingRouter struct {
+	failingRouter
+	closeErr error
+	closed   atomic.Int32
+}
+
+func (r *closeCountingRouter) Close() error {
+	r.closed.Add(1)
+	return r.closeErr
+}
+
+// closeCountingTUN counts the Close calls of the device it wraps.
+type closeCountingTUN struct {
+	tun.Device
+	closeErr error
+	closed   atomic.Int32
+}
+
+func (d *closeCountingTUN) Close() error {
+	d.closed.Add(1)
+	return errors.Join(d.Device.Close(), d.closeErr)
+}
+
+// TestNewUserspaceEngineErrorCleanup checks that a constructor that fails
+// after binding its sockets releases its UDP port, closes its resources
+// once each and reports their errors in cleanup order.
+func TestNewUserspaceEngineErrorCleanup(t *testing.T) {
+	envknob.SetenvForTest(t, "TS_DEBUG_ALWAYS_USE_DERP", "false")
+	bus := eventbustest.NewBus(t)
+	watcher := eventbustest.NewWatcher(t, bus)
+
+	bird := new(closeCountingBird)
+	defer HookNewBird.SetForTest(func(logger.Logf, string) (Bird, error) { return bird, nil })()
+	osCfg := new(closeCountingOSConfigurator)
+	setErr := errors.New("router Set failed")
+	closeErr := errors.New("router Close failed")
+	tunErr := errors.New("TUN Close failed")
+	dev := &closeCountingTUN{Device: tuntest.NewChannelTUN().TUN(), closeErr: tunErr}
+	rtr := &closeCountingRouter{failingRouter: failingRouter{setErr}, closeErr: closeErr}
+	_, err := NewUserspaceEngine(t.Logf, Config{
+		Tun:           dev,
+		Router:        rtr,
+		DNS:           osCfg,
+		BIRDSocket:    "bird.ctl",
+		HealthTracker: health.NewTracker(bus),
+		Metrics:       new(usermetric.Registry),
+		EventBus:      bus,
+	})
+	want := []error{setErr, closeErr, tunErr}
+	joined, ok := err.(interface{ Unwrap() []error })
+	if !ok || len(joined.Unwrap()) != len(want) {
+		t.Fatalf("NewUserspaceEngine error = %v, want causes %v", err, want)
+	}
+	for i, cause := range want {
+		if !errors.Is(err, cause) || !errors.Is(joined.Unwrap()[i], cause) {
+			t.Errorf("NewUserspaceEngine error = %v, want cause %d to match %v", err, i, cause)
+		}
+	}
+	if n := dev.closed.Load(); n != 1 {
+		t.Errorf("device closed %d times, want 1", n)
+	}
+	if n := rtr.closed.Load(); n != 1 {
+		t.Errorf("router closed %d times, want 1", n)
+	}
+	if n, want := osCfg.closed.Load(), closes(buildfeatures.HasDNS); n != want {
+		t.Errorf("DNS configurator closed %d times, want %d", n, want)
+	}
+	if n, want := bird.closed.Load(), closes(buildfeatures.HasBird); n != want {
+		t.Errorf("BIRD client closed %d times, want %d", n, want)
+	}
+	if !buildfeatures.HasUDPTransport || runtime.GOOS == "js" {
+		return
+	}
+	var port uint16
+	if err := eventbustest.Expect(watcher, func(p router.PortUpdate) bool {
+		if p.EndpointNetwork != "udp4" {
+			return false
+		}
+		port = p.UDPPort
+		return true
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if port == 0 {
+		t.Fatal("magicsock reported UDP4 port zero")
+	}
+	c, err := net.ListenUDP("udp4", &net.UDPAddr{Port: int(port)})
+	if err != nil {
+		t.Fatalf("UDP port %d still bound: %v", port, err)
+	}
+	c.Close()
+}
+
+func TestCloseOnErrorPoolPreservesStartupError(t *testing.T) {
+	startup := errors.New("startup failed")
+	err := startup
+	var pool closeOnErrorPool
+	pool.add(func() error { return nil })
+	pool.closeAllIfError(&err)
+	if err != startup {
+		t.Errorf("successful cleanup replaced the startup error with %v", err)
+	}
+}
+
+// closes returns the number of closes expected of a backend that is
+// compiled in when has is true.
+func closes(has bool) int32 {
+	if has {
+		return 1
+	}
+	return 0
+}
+
+// closeCountingOSConfigurator is a dns.OSConfigurator that counts its Close
+// calls.
+type closeCountingOSConfigurator struct {
+	recordingOSConfigurator
+	closed atomic.Int32
+}
+
+func (c *closeCountingOSConfigurator) Close() error { c.closed.Add(1); return nil }
+
+// closeCountingBird is a Bird that counts its Close calls.
+type closeCountingBird struct {
+	closed atomic.Int32
+}
+
+func (*closeCountingBird) Reconfig(tailcfg.NodeView) bool { return false }
+func (*closeCountingBird) ReconfigDone()                  {}
+func (b *closeCountingBird) Close()                       { b.closed.Add(1) }
 
 // recordingOSConfigurator is a dns.OSConfigurator that records whether SetDNS
 // was called.

@@ -89,8 +89,8 @@ type linuxRouter struct {
 	// interfaceV6UsableMemo memoizes interfaceV6Usable for the duration of a
 	// single Set, so its many getV6Available calls don't each hit /proc. It's
 	// an atomic tri-state (see the memoV6 constants) because getV6Available is
-	// also reached, without holding mu, from the onIPRuleDeleted timer's
-	// justAddIPRules; the unset value there means "read live". See #20447.
+	// also reached outside Set, from the onIPRuleDeleted timer's rule repair;
+	// the unset value there means "read live". See #20447.
 	interfaceV6UsableMemo atomic.Int32
 
 	// ipPolicyPrefBase is the base priority at which ip rules are installed.
@@ -98,6 +98,11 @@ type linuxRouter struct {
 
 	cmd commandRunner
 	nfr linuxfw.NetfilterRunner
+
+	// ruleFamilies records the families claimed by Up, under mu. A repair
+	// can run after IPv6 appears, and Close can run after it disappears.
+	// A nil slice means the router has no claim on those families.
+	ruleFamilies []addrFamily
 
 	mu                sync.Mutex
 	addrs             map[netip.Prefix]bool
@@ -359,12 +364,26 @@ func (r *linuxRouter) onIPRuleDeleted(table uint8, priority uint32) {
 
 	r.rulesAddedPub.Publish(AddIPRules{})
 
-	time.AfterFunc(rr.Delay()+250*time.Millisecond, func() {
-		if r.ruleRestorePending.Swap(false) && !r.closed.Load() {
-			r.logf("somebody (likely systemd-networkd) deleted ip rules; restoring Tailscale's")
-			r.justAddIPRules()
-		}
-	})
+	time.AfterFunc(rr.Delay()+250*time.Millisecond, r.restoreIPRules)
+}
+
+func (r *linuxRouter) restoreIPRules() {
+	if !r.ruleRestorePending.Swap(false) || r.closed.Load() {
+		return
+	}
+	r.logf("somebody (likely systemd-networkd) deleted ip rules; restoring Tailscale's")
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	// Close can start after the timer fires. Serialize its final removal
+	// with these writes, including the check that this router is active.
+	if r.closed.Load() || r.ruleFamilies == nil {
+		return
+	}
+	families := r.ruleFamilies
+	if len(families) == 2 && !r.getV6Available() {
+		families = families[:1] // IPv4 is always first.
+	}
+	r.justAddIPRules(families)
 }
 
 func (r *linuxRouter) Up() error {
@@ -373,7 +392,8 @@ func (r *linuxRouter) Up() error {
 	if err := r.setNetfilterModeLocked(netfilterOff); err != nil {
 		return fmt.Errorf("setting netfilter mode: %w", err)
 	}
-	if err := r.addIPRules(); err != nil {
+	r.ruleFamilies = r.addrFamilies()
+	if err := r.addIPRules(r.ruleFamilies); err != nil {
 		return fmt.Errorf("adding IP rules: %w", err)
 	}
 	if err := r.upInterface(); err != nil {
@@ -384,37 +404,45 @@ func (r *linuxRouter) Up() error {
 }
 
 func (r *linuxRouter) Close() error {
+	// Drain event handlers before taking r.mu because they take it too.
+	// Concurrent closes must all wait for the same drain.
+	if !r.closed.Swap(true) {
+		r.eventClient.Close()
+	}
+	<-r.eventClient.Done()
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.closed.Store(true)
 	if r.unregNetMon != nil {
 		r.unregNetMon()
-	}
-	r.eventClient.Close()
-
-	// Clean up connmark rules
-	if err := r.nfr.DelConnmarkSaveRule(); err != nil {
-		r.logf("warning: failed to delete connmark rules: %v", err)
+		r.unregNetMon = nil
 	}
 
-	if err := r.downInterface(); err != nil {
-		return err
-	}
-	if err := r.delIPRules(); err != nil {
-		return err
-	}
-	if err := r.setNetfilterModeLocked(netfilterOff); err != nil {
-		return err
-	}
-	if err := r.delRoutes(); err != nil {
-		return err
+	if r.ruleFamilies == nil {
+		return nil
 	}
 
+	// Clean up connmark rules. r.nfr is nil if Set failed to replace it.
+	if r.nfr != nil {
+		if err := r.nfr.DelConnmarkSaveRule(); err != nil {
+			r.logf("warning: failed to delete connmark rules: %v", err)
+		}
+	}
+
+	// Close may follow a partial Up, so every step runs even if an earlier
+	// one fails.
+	err := errors.Join(
+		r.downInterface(),
+		r.delIPRules(r.ruleFamilies),
+		r.setNetfilterModeLocked(netfilterOff),
+		r.delRoutes(),
+	)
+
+	r.ruleFamilies = nil
 	r.addrs = nil
 	r.routes = nil
 	r.localRoutes = nil
 
-	return nil
+	return err
 }
 
 // setupNetfilterLocked initializes the NetfilterRunner in r.nfr. It expects r.nfr
@@ -1502,18 +1530,18 @@ func (r *linuxRouter) addrFamilies() []addrFamily {
 // addIPRules adds the policy routing rule that avoids tailscaled
 // routing loops. If the rule exists and appears to be a
 // tailscale-managed rule, it is gracefully replaced.
-func (r *linuxRouter) addIPRules() error {
+func (r *linuxRouter) addIPRules(families []addrFamily) error {
 	if !r.ipRuleAvailable {
 		return nil
 	}
 
 	// Clear out old rules. After that, any error adding a rule is fatal,
 	// because there should be no reason we add a duplicate.
-	if err := r.delIPRules(); err != nil {
+	if err := r.delIPRules(families); err != nil {
 		return err
 	}
 
-	return r.justAddIPRules()
+	return r.justAddIPRules(families)
 }
 
 // RouteTable is a Linux routing table: both its name and number.
@@ -1656,15 +1684,15 @@ func ipRules() []netlink.Rule {
 }
 
 // justAddIPRules adds policy routing rule without deleting any first.
-func (r *linuxRouter) justAddIPRules() error {
+func (r *linuxRouter) justAddIPRules(families []addrFamily) error {
 	if !r.ipRuleAvailable {
 		return nil
 	}
 	if r.useIPCommand() {
-		return r.addIPRulesWithIPCommand()
+		return r.addIPRulesWithIPCommand(families)
 	}
 	var errAcc error
-	for _, family := range r.addrFamilies() {
+	for _, family := range families {
 		for _, ru := range ipRules() {
 			// Note: r is a value type here; safe to mutate it.
 			ru.Family = family.netlinkInt()
@@ -1690,10 +1718,10 @@ func (r *linuxRouter) justAddIPRules() error {
 	return errAcc
 }
 
-func (r *linuxRouter) addIPRulesWithIPCommand() error {
+func (r *linuxRouter) addIPRulesWithIPCommand(families []addrFamily) error {
 	rg := newRunGroup(nil, r.cmd)
 
-	for _, family := range r.addrFamilies() {
+	for _, family := range families {
 		for _, rule := range ipRules() {
 			args := []string{
 				"ip", family.dashArg(),
@@ -1733,15 +1761,15 @@ func (r *linuxRouter) delRoutes() error {
 
 // delIPRules removes the policy routing rules that avoid
 // tailscaled routing loops, if it exists.
-func (r *linuxRouter) delIPRules() error {
+func (r *linuxRouter) delIPRules(families []addrFamily) error {
 	if !r.ipRuleAvailable {
 		return nil
 	}
 	if r.useIPCommand() {
-		return r.delIPRulesWithIPCommand()
+		return r.delIPRulesWithIPCommand(families)
 	}
 	var errAcc error
-	for _, family := range r.addrFamilies() {
+	for _, family := range families {
 		for _, ru := range ipRules() {
 			// Note: r is a value type here; safe to mutate it.
 			// When deleting rules, we want to be a bit specific (mention which
@@ -1770,7 +1798,7 @@ func (r *linuxRouter) delIPRules() error {
 	return errAcc
 }
 
-func (r *linuxRouter) delIPRulesWithIPCommand() error {
+func (r *linuxRouter) delIPRulesWithIPCommand(families []addrFamily) error {
 	// Error codes: 'ip rule' returns error code 2 if the rule is a
 	// duplicate (add) or not found (del). It returns a different code
 	// for syntax errors. This is also true of busybox.
@@ -1779,7 +1807,7 @@ func (r *linuxRouter) delIPRulesWithIPCommand() error {
 	// unknown rules during deletion.
 	rg := newRunGroup([]int{2, 254}, r.cmd)
 
-	for _, family := range r.addrFamilies() {
+	for _, family := range families {
 		// When deleting rules, we want to be a bit specific (mention which
 		// table we were routing to) but not *too* specific (fwmarks, etc).
 		// That leaves us some flexibility to change these values in later
