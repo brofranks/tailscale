@@ -11,12 +11,14 @@ import (
 	"os"
 	"reflect"
 	"regexp"
+	"runtime"
 	"slices"
 	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/tailscale/netlink"
@@ -1023,6 +1025,8 @@ type fakeOS struct {
 	ips    []string
 	routes []string
 	rules  []string
+	// downErr, if set, is returned when the interface is brought down.
+	downErr error
 	// This test tests on the router level, so we will not bother
 	// with using iptables or nftables, chose the simpler one.
 	nfr linuxfw.NetfilterRunner
@@ -1114,6 +1118,9 @@ func (o *fakeOS) run(args ...string) error {
 		case "set dev tailscale0 up":
 			o.up = true
 		case "set dev tailscale0 down":
+			if o.downErr != nil {
+				return o.downErr
+			}
 			o.up = false
 		default:
 			return unexpected()
@@ -1146,7 +1153,12 @@ func (o *fakeOS) run(args ...string) error {
 	case "del":
 		found := false
 		for i, el := range *ls {
-			if el == rest {
+			// The rule deletion specifies family, priority and action. The
+			// kernel also matches entries with omitted source or mark selectors.
+			matchRule := args[1] == "rule" && len(args) == 7 && args[3] == "pref" &&
+				strings.HasPrefix(el, family+" pref "+args[4]+" ") &&
+				strings.HasSuffix(el, " "+args[5]+" "+args[6])
+			if el == rest || matchRule {
 				found = true
 				*ls = append((*ls)[:i], (*ls)[i+1:]...)
 				break
@@ -1333,9 +1345,10 @@ func TestAddRemoveRules(t *testing.T) {
 	defer lt.Close()
 	r := lt.r
 
-	step := func(name string, f func() error) {
+	families := r.addrFamilies()
+	step := func(name string, f func([]addrFamily) error) {
 		t.Logf("Doing %v ...", name)
-		if err := f(); err != nil {
+		if err := f(families); err != nil {
 			t.Fatalf("%s: %v", name, err)
 		}
 		rules, err := netlink.RuleList(netlink.FAMILY_ALL)
@@ -1656,6 +1669,15 @@ func TestSetSkipsNetfilterAddonsWhenSetupFails(t *testing.T) {
 // ready for Set, mirroring TestSetSkipsNetfilterAddonsWhenSetupFails.
 func newTestLinuxRouter(t *testing.T) (*linuxRouter, *fakeOS) {
 	t.Helper()
+	lr, fake := newTestLinuxRouterBeforeUp(t, logger.Discard)
+	if err := lr.Up(); err != nil {
+		t.Fatalf("Up: %v", err)
+	}
+	return lr, fake
+}
+
+func newTestLinuxRouterBeforeUp(t *testing.T, logf logger.Logf) (*linuxRouter, *fakeOS) {
+	t.Helper()
 	bus := eventbus.New()
 	t.Cleanup(bus.Close)
 	mon, err := netmon.New(bus, logger.Discard)
@@ -1667,7 +1689,7 @@ func newTestLinuxRouter(t *testing.T) (*linuxRouter, *fakeOS) {
 
 	fake := NewFakeOS(t)
 	ht := health.NewTracker(bus)
-	r, err := newUserspaceRouterAdvanced(logger.Discard, "tailscale0", mon, fake, ht, bus)
+	r, err := newUserspaceRouterAdvanced(logf, "tailscale0", mon, fake, ht, bus)
 	if err != nil {
 		t.Fatalf("newUserspaceRouterAdvanced: %v", err)
 	}
@@ -1676,11 +1698,263 @@ func newTestLinuxRouter(t *testing.T) (*linuxRouter, *fakeOS) {
 	// Keep the fake netfilter runner's HasIPV6 (noV6) the sole v6 signal;
 	// don't consult the live /proc for the tun's IPv6 state. See #20447.
 	lr.interfaceV6Usable = func() bool { return true }
-	if err := lr.Up(); err != nil {
-		t.Fatalf("Up: %v", err)
-	}
 	t.Cleanup(func() { lr.Close() })
 	return lr, fake
+}
+
+// TestCloseWithoutNetfilter verifies that Close on a router whose netfilter
+// setup failed during Up, leaving it without a runner, does not panic and
+// leaves alone the policy rules that Up never reached.
+func TestCloseWithoutNetfilter(t *testing.T) {
+	bus := eventbus.New()
+	defer bus.Close()
+	mon, err := netmon.New(bus, logger.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mon.Start()
+	defer mon.Close()
+
+	fake := NewFakeOS(t)
+	r, err := newUserspaceRouterAdvanced(logger.Discard, "tailscale0", mon, fake, health.NewTracker(bus), bus)
+	if err != nil {
+		t.Fatalf("newUserspaceRouterAdvanced: %v", err)
+	}
+	rules := []string{"-4 pref 5270 table 52"}
+	fake.rules = slices.Clone(rules)
+	if err := r.Close(); err != nil {
+		t.Errorf("Close = %v; want nil", err)
+	}
+	if !slices.Equal(fake.rules, rules) {
+		t.Errorf("rules after Close = %q; want %q", fake.rules, rules)
+	}
+}
+
+// TestCloseUsesInstalledRuleFamilies changes tunnel IPv6 availability after
+// Up. A rule added by this router must be removed, and one which predates an
+// IPv4-only startup must survive.
+func TestCloseUsesInstalledRuleFamilies(t *testing.T) {
+	const (
+		v4Rule = "-4 pref 5270 table 52"
+		v6Rule = "-6 pref 5270 table 52"
+	)
+	for _, tc := range []struct {
+		name           string
+		atUp, atRepair bool
+		foreign        string
+	}{
+		{"lost", true, false, ""},
+		{"dual-stack-repair", true, true, ""},
+		{"gain", false, true, ""},
+		{"gain-existing", false, true, v6Rule},
+		{"gain-source-specific", false, true, "-6 pref 5270 from 2001:db8::1 table 52"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, host := newTestLinuxRouterBeforeUp(t, logger.Discard)
+			v6 := tc.atUp
+			r.interfaceV6Usable = func() bool { return v6 }
+			if tc.foreign != "" {
+				host.rules = append(host.rules, tc.foreign)
+			}
+			before := slices.Clone(host.rules)
+			if err := r.Up(); err != nil {
+				t.Fatal(err)
+			}
+			// The host removed the router's rules but kept its own.
+			host.rules = slices.Clone(before)
+			v6 = tc.atRepair
+			r.ruleRestorePending.Store(true)
+			r.restoreIPRules()
+			if !slices.Contains(host.rules, v4Rule) {
+				t.Fatal("IPv4 policy rule missing after repair")
+			}
+			wantV6 := tc.atUp && tc.atRepair || tc.foreign == v6Rule
+			if got := slices.Contains(host.rules, v6Rule); got != wantV6 {
+				t.Fatalf("IPv6 policy rule after repair = %v, want %v", got, wantV6)
+			}
+			v6 = false
+			if err := r.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if !slices.Equal(host.rules, before) {
+				t.Errorf("rules after Close = %q, want %q", host.rules, before)
+			}
+		})
+	}
+}
+
+// TestRuleRepairOverlapsClose verifies that a rule repair already running
+// when Close starts cannot reinstall the rules Close removed.
+func TestRuleRepairOverlapsClose(t *testing.T) {
+	entered, resume, done := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	logf := func(format string, args ...any) {
+		if strings.Contains(format, "restoring Tailscale's") {
+			close(entered)
+			<-resume
+		}
+	}
+	r, host := newTestLinuxRouterBeforeUp(t, logf)
+	if err := r.Up(); err != nil {
+		t.Fatal(err)
+	}
+	r.ruleRestorePending.Store(true)
+	go func() {
+		defer close(done)
+		r.restoreIPRules()
+	}()
+	<-entered
+	err := r.Close()
+	close(resume)
+	<-done
+	if err != nil {
+		t.Fatal(err)
+	}
+	if slices.Contains(host.rules, "-4 pref 5270 table 52") {
+		t.Error("rule repair reinstated the IPv4 lookup after Close")
+	}
+}
+
+// TestCloseAfterNetfilterLost verifies that Close still removes the policy
+// rules of a running router after a failed Set left it without a netfilter
+// runner.
+func TestCloseAfterNetfilterLost(t *testing.T) {
+	lr, fake := newTestLinuxRouter(t)
+	const v4Rule = "-4 pref 5270 table 52"
+	const v6Rule = "-6 pref 5270 table 52"
+	if !slices.Contains(fake.rules, v4Rule) || !slices.Contains(fake.rules, v6Rule) {
+		t.Fatalf("missing rule after Up: %q", fake.rules)
+	}
+	lr.nfr = nil
+	lr.Close()
+	if slices.Contains(fake.rules, v4Rule) || slices.Contains(fake.rules, v6Rule) {
+		t.Errorf("rules after Close = %q; want no table 52 rule", fake.rules)
+	}
+}
+
+// TestCloseDuringPortUpdate verifies that Close does not hold the router's
+// mutex while it waits for a port update handler that needs the same mutex.
+func TestCloseDuringPortUpdate(t *testing.T) {
+	var gaveUp atomic.Bool
+	bus := eventbus.NewWithOptions(eventbus.BusOptions{Logf: func(format string, args ...any) {
+		if strings.Contains(format, "giving up on subscriber") {
+			gaveUp.Store(true)
+		}
+	}})
+	defer bus.Close()
+	mon, err := netmon.New(bus, logger.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mon.Start()
+	defer mon.Close()
+
+	// The handler logs before it takes the mutex. Hold it there until Close
+	// has begun.
+	var lr *linuxRouter
+	started := make(chan struct{})
+	logf := func(format string, args ...any) {
+		if strings.HasPrefix(format, "portUpdate(") {
+			close(started)
+			for !lr.closed.Load() {
+				runtime.Gosched()
+			}
+		}
+	}
+	fake := NewFakeOS(t)
+	r, err := newUserspaceRouterAdvanced(logf, "tailscale0", mon, fake, health.NewTracker(bus), bus)
+	if err != nil {
+		t.Fatalf("newUserspaceRouterAdvanced: %v", err)
+	}
+	lr = r.(*linuxRouter)
+	lr.nfr = fake.nfr
+
+	pub := bus.Client("test")
+	defer pub.Close()
+	eventbus.Publish[router.PortUpdate](pub).Publish(router.PortUpdate{UDPPort: 41641, EndpointNetwork: "udp4"})
+	<-started
+	lr.Close()
+	if gaveUp.Load() {
+		t.Error("Close waited for a handler blocked on the router's mutex")
+	}
+}
+
+func TestConcurrentCloseWaitsForRouterEvents(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		bus := eventbus.New()
+		defer bus.Close()
+		r := &linuxRouter{eventClient: bus.Client("router")}
+		entered, resume := make(chan struct{}), make(chan struct{})
+		eventbus.SubscribeFunc(r.eventClient, func(router.PortUpdate) {
+			close(entered)
+			<-resume
+		})
+		pub := bus.Client("test")
+		defer pub.Close()
+		eventbus.Publish[router.PortUpdate](pub).Publish(router.PortUpdate{})
+		<-entered
+
+		done := make(chan error, 2)
+		for range 2 {
+			go func() { done <- r.Close() }()
+		}
+		synctest.Wait()
+		if len(done) != 0 {
+			t.Error("Close returned while the router event handler was running")
+		}
+		close(resume)
+		for range 2 {
+			if err := <-done; err != nil {
+				t.Fatal(err)
+			}
+		}
+	})
+}
+
+// TestCloseContinuesAfterError verifies that Close removes the policy rules
+// even when the interface cannot be brought down.
+func TestCloseContinuesAfterError(t *testing.T) {
+	lr, fake := newTestLinuxRouter(t)
+	if len(fake.rules) == 0 {
+		t.Fatal("Up installed no policy rules")
+	}
+	fake.downErr = errExec
+	if err := lr.Close(); !errors.Is(err, errExec) {
+		t.Errorf("Close = %v; want %v", err, errExec)
+	}
+	if len(fake.rules) != 0 {
+		t.Errorf("rules after Close = %q, want none", fake.rules)
+	}
+}
+
+func TestClosePreservesReplacementRules(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		downErr error
+	}{
+		{"success", nil},
+		{"down-error", errExec},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, host := newTestLinuxRouter(t)
+			host.downErr = tc.downErr
+			if err := r.Close(); !errors.Is(err, tc.downErr) {
+				t.Fatalf("first Close = %v, want %v", err, tc.downErr)
+			}
+
+			// A replacement brought the same interface up and claimed table 52.
+			host.up = true
+			host.downErr = nil
+			want := []string{"-4 pref 5270 table 52", "-6 pref 5270 table 52"}
+			host.rules = slices.Clone(want)
+			r.interfaceV6Usable = func() bool { return false }
+			if err := r.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if !host.up || !slices.Equal(host.rules, want) {
+				t.Errorf("second Close left up=%v, rules=%q, want up with %q", host.up, host.rules, want)
+			}
+		})
+	}
 }
 
 // TestSetRemovesOrphanedTailscaleAddrs verifies that Set removes Tailscale-range

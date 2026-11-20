@@ -17,3 +17,13 @@ func TestGetNetshPath(t *testing.T) {
 		t.Errorf("expected absolute path for netsh.exe: %q", path)
 	}
 }
+
+func TestCloseBeforeUpLeavesFirewallUnused(t *testing.T) {
+	r := &winRouter{firewall: &firewallTweaker{logf: func(format string, args ...any) {
+		// Fail on the synchronous request, before a worker can run netsh.
+		t.Fatalf(format, args...)
+	}}}
+	if err := r.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
