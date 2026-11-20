@@ -49,6 +49,7 @@ import (
 	"tailscale.com/net/dnsfallback"
 	"tailscale.com/net/netmon"
 	"tailscale.com/net/netns"
+	"tailscale.com/net/tsaddr"
 	"tailscale.com/net/tsdial"
 	"tailscale.com/net/tstun"
 	"tailscale.com/paths"
@@ -869,6 +870,8 @@ func tryEngine(logf logger.Logf, sys *tsd.System, name string) (onlyNetstack boo
 		SetSubsystem:  sys.Set,
 		ControlKnobs:  sys.ControlKnobs(),
 		EventBus:      sys.Bus.Get(),
+
+		DNSServiceAddrs: tsaddr.TailscaleServiceAddrs(),
 	}
 	if f, ok := hookSetWgEnginConfigDrive.GetOk(); ok {
 		f(&conf, logf)

@@ -30,6 +30,7 @@ import (
 	"tailscale.com/tstest"
 	"tailscale.com/types/dnstype"
 	"tailscale.com/types/logger"
+	"tailscale.com/types/views"
 	"tailscale.com/util/dnsname"
 	"tailscale.com/util/eventbus/eventbustest"
 	"tailscale.com/util/set"
@@ -362,6 +363,7 @@ func newResolver(t testing.TB) *Resolver {
 		dialer,
 		health.NewTracker(bus),
 		nil, // no control knobs
+		views.Slice[netip.Addr]{},
 	)
 }
 

@@ -120,8 +120,7 @@ func (v ConfigView) SearchDomains() views.Slice[dnsname.FQDN] {
 
 // Hosts maps DNS FQDNs to their IPs, which can be a mix of IPv4
 // and IPv6.
-// Queries matching entries in Hosts are resolved locally by
-// 100.100.100.100 without leaving the machine.
+// The local resolver answers queries matching entries in Hosts.
 // Adding an entry to Hosts merely creates the record. If you want
 // it to resolve, you also need to add appropriate routes to
 // Routes.
@@ -137,8 +136,7 @@ func (v ConfigView) SubdomainHosts() views.Map[dnsname.FQDN, struct{}] {
 	return views.MapOf(v.ж.SubdomainHosts)
 }
 
-// OnlyIPv6, if true, uses the IPv6 service IP (for MagicDNS)
-// instead of the IPv4 version (100.100.100.100).
+// OnlyIPv6 limits the local DNS listeners published to the OS to IPv6.
 func (v ConfigView) OnlyIPv6() bool { return v.ж.OnlyIPv6 }
 
 // MagicDNSHostsUnrouted is whether MagicDNS host records are

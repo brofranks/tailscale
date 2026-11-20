@@ -32,7 +32,8 @@ type OSConfigurator interface {
 	// GetBaseConfig returns the OS's "base" configuration, i.e. the
 	// resolver settings the OS would use without Tailscale
 	// contributing any configuration.
-	// GetBaseConfig must return the tailscale-free base config even
+	// GetBaseConfig returns the underlying resolver sources. The manager removes
+	// its own listener addresses. Backends must recover the base config even
 	// after SetDNS has been called to set a Tailscale configuration.
 	// Only works when SupportsSplitDNS=false.
 

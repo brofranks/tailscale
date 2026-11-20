@@ -1585,7 +1585,7 @@ func newTestSafeBackend(t *testing.T) *testSafeBackend {
 	dialer := tsdial.NewDialer(netmon.NewStatic())
 	sys.Dialer.Set(dialer)
 	ht := sys.HealthTracker.Get()
-	sys.DNSManager.Set(dns.NewManager(logger.Discard, nil, ht, dialer, nil, nil, "", sys.Bus.Get()))
+	sys.DNSManager.Set(dns.NewManager(logger.Discard, nil, ht, dialer, nil, nil, "", sys.Bus.Get(), nil))
 	sys.Tun.Set(&tstun.Wrapper{})
 	return &testSafeBackend{sys: sys}
 }

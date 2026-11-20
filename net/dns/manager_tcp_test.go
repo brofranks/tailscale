@@ -95,7 +95,7 @@ func TestDNSOverTCP(t *testing.T) {
 	dialer := tsdial.NewDialer(netmon.NewStatic())
 	dialer.SetBus(bus)
 	cknobs := &controlknobs.Knobs{}
-	m := NewManager(t.Logf, &f, health.NewTracker(bus), dialer, nil, cknobs, "", bus)
+	m := NewManager(t.Logf, &f, health.NewTracker(bus), dialer, nil, cknobs, "", bus, serviceAddr46)
 	m.resolver.TestOnlySetHook(f.SetResolver)
 	m.Set(Config{
 		Hosts: hosts(
@@ -183,7 +183,7 @@ func TestDNSOverTCP_TooLarge(t *testing.T) {
 	bus := eventbustest.NewBus(t)
 	dialer := tsdial.NewDialer(netmon.NewStatic())
 	dialer.SetBus(bus)
-	m := NewManager(log, &f, health.NewTracker(bus), dialer, nil, nil, "", bus)
+	m := NewManager(log, &f, health.NewTracker(bus), dialer, nil, nil, "", bus, serviceAddr46)
 	m.resolver.TestOnlySetHook(f.SetResolver)
 	m.Set(Config{
 		Hosts:         hosts("andrew.ts.com.", "1.2.3.4"),

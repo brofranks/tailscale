@@ -220,6 +220,10 @@ type Config struct {
 	// through to magicsock.
 	DERPAppName string
 
+	// DNSServiceAddrs are the local DNS listeners owned by the engine's caller.
+	// An empty slice means there are no local DNS listeners.
+	DNSServiceAddrs []netip.Addr
+
 	// ControlKnobs is the set of control plane-provied knobs
 	// to use.
 	// If nil, defaults are used.
@@ -416,7 +420,7 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error) 
 	conf.Dialer.SetTUNName(tunName)
 	conf.Dialer.SetNetMon(e.netMon)
 	conf.Dialer.SetBus(e.eventBus)
-	e.dns = dns.NewManager(logf, conf.DNS, e.health, conf.Dialer, fwdDNSLinkSelector{e, tunName}, conf.ControlKnobs, runtime.GOOS, e.eventBus)
+	e.dns = dns.NewManager(logf, conf.DNS, e.health, conf.Dialer, fwdDNSLinkSelector{e, tunName}, conf.ControlKnobs, runtime.GOOS, e.eventBus, conf.DNSServiceAddrs)
 	closePool.add(e.dns.Down)
 
 	// TODO: there's probably a better place for this

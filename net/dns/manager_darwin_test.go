@@ -286,3 +286,14 @@ func fileExists(path string) bool {
 
 	panic("unexpected error checking file existence: " + err.Error())
 }
+
+func TestDarwinBaseDNSServiceAddresses(t *testing.T) {
+	m := newTestConfigurator(t)
+	if err := os.WriteFile(m.resolvConfPath, []byte("nameserver 100.100.100.100\nnameserver fd7a:115c:a1e0::53\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := m.GetBaseConfig()
+	if err != nil || !slices.Equal(got.Nameservers, serviceAddr46) {
+		t.Fatalf("base nameservers = %v, %v", got.Nameservers, err)
+	}
+}

@@ -8,6 +8,7 @@ package dns
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"net/netip"
 	"reflect"
@@ -18,8 +19,8 @@ import (
 	"tailscale.com/envknob"
 	"tailscale.com/net/dns/publicdns"
 	"tailscale.com/net/dns/resolver"
-	"tailscale.com/net/tsaddr"
 	"tailscale.com/types/dnstype"
+	"tailscale.com/types/views"
 	"tailscale.com/util/dnsname"
 	"tailscale.com/util/set"
 )
@@ -47,8 +48,7 @@ type Config struct {
 	SearchDomains []dnsname.FQDN
 	// Hosts maps DNS FQDNs to their IPs, which can be a mix of IPv4
 	// and IPv6.
-	// Queries matching entries in Hosts are resolved locally by
-	// 100.100.100.100 without leaving the machine.
+	// The local resolver answers queries matching entries in Hosts.
 	// Adding an entry to Hosts merely creates the record. If you want
 	// it to resolve, you also need to add appropriate routes to
 	// Routes.
@@ -58,8 +58,7 @@ type Config struct {
 	// "node.tailnet.ts.net" is in SubdomainHosts, then queries for
 	// "anything.node.tailnet.ts.net" will resolve to node's IPs.
 	SubdomainHosts set.Set[dnsname.FQDN]
-	// OnlyIPv6, if true, uses the IPv6 service IP (for MagicDNS)
-	// instead of the IPv4 version (100.100.100.100).
+	// OnlyIPv6 limits the local DNS listeners published to the OS to IPv6.
 	OnlyIPv6 bool
 	// MagicDNSHostsUnrouted is whether MagicDNS host records are
 	// served on demand via [resolver.MagicDNSHosts] (so are not
@@ -73,24 +72,25 @@ type Config struct {
 
 var magicDNSDualStack = envknob.RegisterBool("TS_DEBUG_MAGIC_DNS_DUAL_STACK")
 
-// serviceIPs returns the list of service IPs where MagicDNS is reachable.
+// serviceIPs selects owned listeners in the enabled address families.
+// A configuration that needs a local resolver requires at least one.
 //
 // The provided knobs may be nil.
-func (c *Config) serviceIPs(knobs *controlknobs.Knobs) []netip.Addr {
-	if c.OnlyIPv6 {
-		return []netip.Addr{tsaddr.TailscaleServiceIPv6()}
-	}
-
+func (c *Config) serviceIPs(knobs *controlknobs.Knobs, owned views.Slice[netip.Addr]) ([]netip.Addr, error) {
 	// See https://github.com/tailscale/tailscale/issues/15404 for the background
 	// on the opt-in debug knob and the controlknob opt-out.
-	if magicDNSDualStack() || !knobs.ShouldForceRegisterMagicDNSIPv4Only() {
-		return []netip.Addr{
-			tsaddr.TailscaleServiceIP(),
-			tsaddr.TailscaleServiceIPv6(),
+	v4Only := !c.OnlyIPv6 && !magicDNSDualStack() && knobs.ShouldForceRegisterMagicDNSIPv4Only()
+	var ips []netip.Addr
+	for _, ip := range owned.All() {
+		if c.OnlyIPv6 && !ip.Is6() || v4Only && !ip.Is4() {
+			continue
 		}
+		ips = append(ips, ip)
 	}
-
-	return []netip.Addr{tsaddr.TailscaleServiceIP()}
+	if len(ips) == 0 {
+		return nil, errors.New("DNS policy requires a local resolver address in an enabled family")
+	}
+	return ips, nil
 }
 
 // WriteToBufioWriter write a debug version of c for logs to w, omitting

@@ -36,6 +36,7 @@ import (
 	"tailscale.com/syncs"
 	"tailscale.com/types/dnstype"
 	"tailscale.com/types/logger"
+	"tailscale.com/types/views"
 	"tailscale.com/util/clientmetric"
 	"tailscale.com/util/cloudenv"
 	"tailscale.com/util/dnsname"
@@ -235,6 +236,7 @@ type Resolver struct {
 	dialer             *tsdial.Dialer   // non-nil
 	health             *health.Tracker  // non-nil
 	saveConfigForTests func(cfg Config) // used in tests to capture resolver config
+	owned              views.Slice[netip.Addr]
 	// forwarder forwards requests to upstream nameservers.
 	forwarder *forwarder
 
@@ -308,7 +310,7 @@ type ForwardLinkSelector interface {
 
 // New returns a new resolver.
 // dialer and health must be non-nil.
-func New(logf logger.Logf, linkSel ForwardLinkSelector, dialer *tsdial.Dialer, health *health.Tracker, knobs *controlknobs.Knobs) *Resolver {
+func New(logf logger.Logf, linkSel ForwardLinkSelector, dialer *tsdial.Dialer, health *health.Tracker, knobs *controlknobs.Knobs, owned views.Slice[netip.Addr]) *Resolver {
 	if dialer == nil {
 		panic("nil Dialer")
 	}
@@ -327,9 +329,20 @@ func New(logf logger.Logf, linkSel ForwardLinkSelector, dialer *tsdial.Dialer, h
 		ipToHost: map[netip.Addr]dnsname.FQDN{},
 		dialer:   dialer,
 		health:   health,
+		owned:    owned,
 	}
 	r.forwarder = newForwarder(r.logf, netMon, linkSel, dialer, health, knobs)
 	return r
+}
+
+// IsServiceIP reports whether ip identifies one of the local DNS listeners.
+// The OS can qualify a global unicast address with an interface zone.
+func IsServiceIP(listeners views.Slice[netip.Addr], ip netip.Addr) bool {
+	ip = ip.Unmap()
+	return listeners.ContainsFunc(func(local netip.Addr) bool {
+		local = local.Unmap()
+		return ip == local || ip.IsGlobalUnicast() && ip.WithZone("") == local.WithZone("")
+	})
 }
 
 func (r *Resolver) TestOnlySetHook(hook func(Config)) { r.saveConfigForTests = hook }
@@ -509,13 +522,11 @@ func (r *Resolver) HandlePeerDNSQuery(ctx context.Context, q []byte, from netip.
 		// TODO: more than 1 resolver from /etc/resolv.conf?
 
 		var resolvers []resolverAndDelay
-		switch nameserver {
-		case tsaddr.TailscaleServiceIP(), tsaddr.TailscaleServiceIPv6():
-			// If resolv.conf says 100.100.100.100, it's coming right back to us anyway
-			// so avoid the loop through the kernel and just do what we
-			// would've done anyway. By not passing any resolvers, the forwarder
-			// will use its default ones from our DNS config.
-		case netip.Addr{}:
+		switch {
+		case IsServiceIP(r.owned, nameserver):
+			// The OS points back to a local listener. Let the forwarder use
+			// its configured routes to avoid forwarding to ourselves.
+		case !nameserver.IsValid():
 			// Likewise, if the platform has no resolv.conf, just use our defaults.
 		default:
 			resolvers = []resolverAndDelay{{

@@ -303,7 +303,7 @@ func TestUserspaceEngineReconfigDNSAfterRouterError(t *testing.T) {
 	ue.router = failingRouter{err: routerErr}
 
 	osCfg := &recordingOSConfigurator{}
-	ue.dns = dns.NewManager(t.Logf, osCfg, ht, ue.dialer, nil, nil, runtime.GOOS, bus)
+	ue.dns = dns.NewManager(t.Logf, osCfg, ht, ue.dialer, nil, nil, runtime.GOOS, bus, nil)
 
 	nm := &netmap.NetworkMap{
 		Peers: nodeViews([]*tailcfg.Node{{ID: 1, Key: nkFromHex("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")}}),
@@ -548,11 +548,12 @@ func TestLinkChangeReapplyPreservesMagicDNSRoutes(t *testing.T) {
 		t.Fatal(err)
 	}
 	e, err := NewUserspaceEngine(t.Logf, Config{
-		HealthTracker: health.NewTracker(bus),
-		Metrics:       new(usermetric.Registry),
-		EventBus:      bus,
-		DNS:           noop,
-		RespondToPing: true,
+		HealthTracker:   health.NewTracker(bus),
+		Metrics:         new(usermetric.Registry),
+		EventBus:        bus,
+		DNS:             noop,
+		DNSServiceAddrs: []netip.Addr{netip.MustParseAddr("100.100.100.100")},
+		RespondToPing:   true,
 	})
 	if err != nil {
 		t.Fatal(err)

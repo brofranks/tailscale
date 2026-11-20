@@ -30,6 +30,7 @@ import (
 	"tailscale.com/syncs"
 	"tailscale.com/types/dnstype"
 	"tailscale.com/types/logger"
+	"tailscale.com/types/views"
 	"tailscale.com/util/clientmetric"
 	"tailscale.com/util/dnsname"
 	"tailscale.com/util/eventbus"
@@ -82,6 +83,7 @@ type Manager struct {
 	ctxCancel context.CancelFunc // closes ctx
 
 	resolver *resolver.Resolver
+	owned    views.Slice[netip.Addr] // immutable, every family the local resolver serves
 	os       OSConfigurator
 	knobs    *controlknobs.Knobs // or nil
 	goos     string              // if empty, gets set to runtime.GOOS
@@ -94,8 +96,8 @@ type Manager struct {
 
 // NewManager created a new manager from the given config.
 //
-// knobs may be nil.
-func NewManager(logf logger.Logf, oscfg OSConfigurator, health *health.Tracker, dialer *tsdial.Dialer, linkSel resolver.ForwardLinkSelector, knobs *controlknobs.Knobs, goos string, bus *eventbus.Bus) *Manager {
+// knobs may be nil. serviceAddrs lists the IPs owned by the local resolver.
+func NewManager(logf logger.Logf, oscfg OSConfigurator, health *health.Tracker, dialer *tsdial.Dialer, linkSel resolver.ForwardLinkSelector, knobs *controlknobs.Knobs, goos string, bus *eventbus.Bus, serviceAddrs []netip.Addr) *Manager {
 	if !buildfeatures.HasDNS {
 		return nil
 	}
@@ -110,9 +112,11 @@ func NewManager(logf logger.Logf, oscfg OSConfigurator, health *health.Tracker, 
 		goos = runtime.GOOS
 	}
 
+	owned := views.SliceOf(slices.Clone(serviceAddrs))
 	m := &Manager{
 		logf:     logf,
-		resolver: resolver.New(logf, linkSel, dialer, health, knobs),
+		resolver: resolver.New(logf, linkSel, dialer, health, knobs, owned),
+		owned:    owned,
 		os:       oscfg,
 		health:   health,
 		knobs:    knobs,
@@ -193,7 +197,22 @@ func (m *Manager) GetBaseConfig() (OSConfig, error) {
 	if !buildfeatures.HasDNS {
 		panic("unreachable")
 	}
-	return m.os.GetBaseConfig()
+	base, err := m.os.GetBaseConfig()
+	if err != nil || m.owned.Len() == 0 {
+		return base, err
+	}
+	// A backup or another interface can refer back to one of our listeners.
+	// The backend may retain its snapshot for subsequent network changes.
+	owned := func(ip netip.Addr) bool { return resolver.IsServiceIP(m.owned, ip) }
+	base.Nameservers = slices.DeleteFunc(slices.Clone(base.Nameservers), owned)
+	base.Resolvers = slices.DeleteFunc(slices.Clone(base.Resolvers), func(r *dnstype.Resolver) bool {
+		if r == nil {
+			return false
+		}
+		ap, ok := r.IPPort()
+		return ok && ap.Port() == 53 && owned(ap.Addr())
+	})
+	return base, nil
 }
 
 // setLocked sets the DNS configuration.
@@ -394,7 +413,10 @@ func (m *Manager) compileConfig(cfg Config) (rcfg resolver.Config, ocfg OSConfig
 		// through quad-100.
 		rcfg.Routes = routes
 		rcfg.Routes["."] = cfg.DefaultResolvers
-		ocfg.Nameservers = cfg.serviceIPs(m.knobs)
+		ocfg.Nameservers, err = cfg.serviceIPs(m.knobs, m.owned)
+		if err != nil {
+			return resolver.Config{}, OSConfig{}, err
+		}
 		return rcfg, ocfg, nil
 	}
 
@@ -433,7 +455,10 @@ func (m *Manager) compileConfig(cfg Config) (rcfg resolver.Config, ocfg OSConfig
 	// or routes + MagicDNS, or just MagicDNS, or on an OS that cannot
 	// split-DNS. Install a split config pointing at quad-100.
 	rcfg.Routes = routes
-	ocfg.Nameservers = cfg.serviceIPs(m.knobs)
+	ocfg.Nameservers, err = cfg.serviceIPs(m.knobs, m.owned)
+	if err != nil {
+		return resolver.Config{}, OSConfig{}, err
+	}
 
 	// Apple tunnels can contribute global search domains only through
 	// matchDomains with matchDomainsNoSearch=false; NEDNSSettings.searchDomains
@@ -461,7 +486,7 @@ func (m *Manager) compileConfig(cfg Config) (rcfg resolver.Config, ocfg OSConfig
 	// [OSConfigurator.GetBaseConfig] can temporarily fail immediately after an
 	// interface change. These failures should be retried if/when the OS indicates
 	// that the DNS configuration has changed via [RecompileDNSConfig].
-	base, err := m.os.GetBaseConfig()
+	base, err := m.GetBaseConfig()
 	if err != nil {
 		if errors.Is(err, ErrGetBaseConfigNoResolvers) {
 			m.health.SetHealthy(OSConfigurationReadWarnable)
@@ -854,7 +879,7 @@ func CleanUp(logf logger.Logf, netMon *netmon.Monitor, bus *eventbus.Bus, health
 	d := &tsdial.Dialer{Logf: logf}
 	d.SetNetMon(netMon)
 	d.SetBus(bus)
-	dns := NewManager(logf, oscfg, health, d, nil, nil, runtime.GOOS, bus)
+	dns := NewManager(logf, oscfg, health, d, nil, nil, runtime.GOOS, bus, nil)
 	if err := dns.Down(); err != nil {
 		logf("dns down: %v", err)
 	}

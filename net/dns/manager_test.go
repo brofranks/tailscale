@@ -1280,7 +1280,7 @@ func TestManager(t *testing.T) {
 			bus := eventbustest.NewBus(t)
 			dialer := tsdial.NewDialer(netmon.NewStatic())
 			dialer.SetBus(bus)
-			m := NewManager(t.Logf, &f, health.NewTracker(bus), dialer, nil, knobs, goos, bus)
+			m := NewManager(t.Logf, &f, health.NewTracker(bus), dialer, nil, knobs, goos, bus, serviceAddr46)
 			m.resolver.TestOnlySetHook(f.SetResolver)
 
 			if err := m.Set(test.in); err != nil {
@@ -1389,7 +1389,7 @@ func TestConfigRecompilation(t *testing.T) {
 	bus := eventbustest.NewBus(t)
 	dialer := tsdial.NewDialer(netmon.NewStatic())
 	dialer.SetBus(bus)
-	m := NewManager(t.Logf, f, health.NewTracker(bus), dialer, nil, nil, "darwin", bus)
+	m := NewManager(t.Logf, f, health.NewTracker(bus), dialer, nil, nil, "darwin", bus, serviceAddr46)
 
 	var managerConfig *resolver.Config
 	m.resolver.TestOnlySetHook(func(cfg resolver.Config) {
@@ -1433,7 +1433,7 @@ func newEmptyBaseConfigManager(t *testing.T) (*Manager, *fakeOSConfigurator, *he
 	ht.SetAnyInterfaceUp(true) // else NetworkStatusWarnable suppresses the warning
 	dialer := tsdial.NewDialer(netmon.NewStatic())
 	dialer.SetBus(bus)
-	m := NewManager(t.Logf, f, ht, dialer, nil, nil, "linux", bus)
+	m := NewManager(t.Logf, f, ht, dialer, nil, nil, "linux", bus, serviceAddr46)
 	m.resolver.TestOnlySetHook(f.SetResolver)
 	t.Cleanup(func() { m.Down() }) // stop the retry goroutine before the test ends
 	return m, f, ht
@@ -1552,7 +1552,7 @@ func TestEmptyBaseConfigPlatforms(t *testing.T) {
 			bus := eventbustest.NewBus(t)
 			dialer := tsdial.NewDialer(netmon.NewStatic())
 			dialer.SetBus(bus)
-			m := NewManager(t.Logf, f, health.NewTracker(bus), dialer, nil, nil, test.goos, bus)
+			m := NewManager(t.Logf, f, health.NewTracker(bus), dialer, nil, nil, test.goos, bus, serviceAddr46)
 			m.resolver.TestOnlySetHook(f.SetResolver)
 			t.Cleanup(func() { m.Down() })
 
@@ -1744,7 +1744,7 @@ func TestTrampleRetrample(t *testing.T) {
 		bus := eventbustest.NewBus(t)
 		dialer := tsdial.NewDialer(netmon.NewStatic())
 		dialer.SetBus(bus)
-		m := NewManager(t.Logf, f, health.NewTracker(bus), dialer, nil, nil, "linux", bus)
+		m := NewManager(t.Logf, f, health.NewTracker(bus), dialer, nil, nil, "linux", bus, serviceAddr46)
 
 		// Initial set should error out and store the config
 		if err := m.Set(config); err != nil {
@@ -1830,7 +1830,7 @@ func TestSystemDNSDoHUpgrade(t *testing.T) {
 	bus := eventbustest.NewBus(t)
 	dialer := tsdial.NewDialer(netmon.NewStatic())
 	dialer.SetBus(bus)
-	m := NewManager(logf, f, health.NewTracker(bus), dialer, nil, &controlknobs.Knobs{}, "linux", bus)
+	m := NewManager(logf, f, health.NewTracker(bus), dialer, nil, &controlknobs.Knobs{}, "linux", bus, serviceAddr46)
 	t.Cleanup(func() { m.Down() })
 
 	// Set up hook to capture the resolver config
@@ -1955,4 +1955,79 @@ func buildTestDNSResponse(t *testing.T, domain string, ip netip.Addr) []byte {
 	}
 
 	return msg
+}
+
+func TestDNSListenerOwnership(t *testing.T) {
+	const old4 = "100.100.100.100"
+	const old6 = "fd7a:115c:a1e0::53"
+	custom := mustIPs("10.99.0.53", "fd42::53")
+	for _, tc := range []struct {
+		name    string
+		owned   []netip.Addr
+		config  Config
+		split   bool
+		want    []netip.Addr
+		wantErr bool
+	}{
+		{"plain", nil, Config{DefaultResolvers: mustRes(old4, old6)}, false, mustIPs(old4, old6), false},
+		{"plain-with-listener", custom, Config{DefaultResolvers: mustRes(old4, old6)}, false, mustIPs(old4, old6), false},
+		{"direct-split", custom, Config{Routes: map[dnsname.FQDN][]*dnstype.Resolver{"corp.example.": mustRes(old4, old6)}}, true, mustIPs(old4, old6), false},
+		{"local-policy", custom, Config{DefaultResolvers: mustRes(old4), Routes: map[dnsname.FQDN][]*dnstype.Resolver{"corp.example.": nil}}, false, custom, false},
+		{"v6-listener", custom[1:], Config{DefaultResolvers: mustRes(old4), Routes: map[dnsname.FQDN][]*dnstype.Resolver{"corp.example.": nil}}, false, custom[1:], false},
+		{"missing-listener", nil, Config{DefaultResolvers: mustRes(old4), Routes: map[dnsname.FQDN][]*dnstype.Resolver{"corp.example.": nil}}, false, nil, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &fakeOSConfigurator{SplitDNS: tc.split}
+			bus := eventbustest.NewBus(t)
+			d := tsdial.NewDialer(netmon.NewStatic())
+			d.SetBus(bus)
+			m := NewManager(t.Logf, f, health.NewTracker(bus), d, nil, nil, "linux", bus, tc.owned)
+			defer m.Down()
+			err := m.Set(tc.config)
+			if (err != nil) != tc.wantErr || !slices.Equal(f.OSConfig.Nameservers, tc.want) {
+				t.Fatalf("published %v, error %v; want %v, error=%v", f.OSConfig.Nameservers, err, tc.want, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestBaseDNSServiceOwnership(t *testing.T) {
+	custom := mustIPs("10.99.0.53", "fd42::53", "fe80::53%tun0")
+	bus := eventbustest.NewBus(t)
+	d := tsdial.NewDialer(netmon.NewStatic())
+	d.SetBus(bus)
+	f := new(fakeOSConfigurator)
+	base := OSConfig{
+		Nameservers: mustIPs("10.99.0.53", "100.100.100.100", "fd42::53%tun0", "fd7a:115c:a1e0::53"),
+		Resolvers: mustRes(
+			"::ffff:10.99.0.53", "[fd42::53%tun0]:53", "100.100.100.100",
+			"10.99.0.53:5353", "fe80::53%tun0", "fe80::53%lan0", "https://dns.example/dns-query",
+		),
+	}
+	f.setBaseConfig(base)
+	m := NewManager(t.Logf, f, health.NewTracker(bus), d, nil, nil, "linux", bus, custom)
+	defer m.Down()
+	m.resolver.TestOnlySetHook(f.SetResolver)
+	cfg := Config{Routes: map[dnsname.FQDN][]*dnstype.Resolver{"corp.example.": nil}}
+	if err := m.Set(cfg); err != nil {
+		t.Fatal(err)
+	}
+	want := mustRes("100.100.100.100", "10.99.0.53:5353", "fe80::53%lan0", "https://dns.example/dns-query")
+	if !reflect.DeepEqual(f.ResolverConfig.Routes["."], want) {
+		t.Fatalf("forwarding = %v, want %v", f.ResolverConfig.Routes["."], want)
+	}
+	got, err := m.GetBaseConfig()
+	if err != nil || !slices.Equal(got.Nameservers, serviceAddr46) || !reflect.DeepEqual(got.Resolvers, want) {
+		t.Fatalf("base = %+v, %v", got, err)
+	}
+	if base.Nameservers[0] != custom[0] || base.Resolvers[0].Addr != "::ffff:10.99.0.53" {
+		t.Fatal("backend snapshot was mutated")
+	}
+	f.setBaseConfig(OSConfig{Nameservers: mustIPs("fd42::53%tun1", "192.0.2.54")})
+	if err := m.RecompileDNSConfig(); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(f.ResolverConfig.Routes["."], mustRes("192.0.2.54")) {
+		t.Fatalf("recompiled forwarding = %v", f.ResolverConfig.Routes["."])
+	}
 }

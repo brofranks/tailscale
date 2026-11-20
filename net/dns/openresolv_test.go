@@ -142,15 +142,13 @@ func TestOpenresolvGetBaseConfig(t *testing.T) {
 			wantArgv: []string{"-i", "-l eth0"},
 		},
 		{
-			// Defense in depth for tailscale/tailscale#7816: quad-100
-			// must never become our own upstream, even if some other
-			// snippet names it.
+			// The manager filters its own listeners after reading other snippets.
 			name: "quad-100_in_another_snippet",
 			resolvconf: fakeResolvconf{
 				listOut: "eth0\n",
 				dumpOut: "nameserver 100.100.100.100\nnameserver 192.168.1.1\nnameserver fd7a:115c:a1e0::53\nsearch lan\n",
 			},
-			wantNameservers: []string{"192.168.1.1"},
+			wantNameservers: []string{"100.100.100.100", "192.168.1.1", "fd7a:115c:a1e0::53"},
 			wantSearch:      []string{"lan."},
 			wantArgv:        []string{"-i", "-l eth0"},
 		},

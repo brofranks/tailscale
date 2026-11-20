@@ -11,6 +11,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
@@ -199,5 +200,20 @@ func TestReadResolve(t *testing.T) {
 			c.Assert(err, qt.IsNil)
 		}
 		c.Assert(cfg, qt.DeepEquals, test.want)
+	}
+}
+
+func TestDirectBaseDNSServiceAddresses(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "etc"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "etc", "resolv.conf"), []byte("nameserver 100.100.100.100\nnameserver fd7a:115c:a1e0::53\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	m := directManager{fs: directFS{prefix: root}, logf: t.Logf}
+	got, err := m.GetBaseConfig()
+	if err != nil || !slices.Equal(got.Nameservers, serviceAddr46) {
+		t.Fatalf("base nameservers = %v, %v", got.Nameservers, err)
 	}
 }

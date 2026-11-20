@@ -45,6 +45,11 @@ var (
 	serviceIPv6  oncePrefix
 )
 
+// TailscaleServiceAddrs returns the IPv4 and IPv6 listeners owned by tailscaled.
+func TailscaleServiceAddrs() []netip.Addr {
+	return []netip.Addr{TailscaleServiceIP(), TailscaleServiceIPv6()}
+}
+
 // TailscaleServiceIP returns the IPv4 listen address of services
 // provided by Tailscale itself such as the MagicDNS proxy.
 //

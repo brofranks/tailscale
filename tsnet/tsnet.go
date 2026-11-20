@@ -200,6 +200,7 @@ import (
 	"tailscale.com/net/netmon"
 	"tailscale.com/net/proxymux"
 	"tailscale.com/net/socks5"
+	"tailscale.com/net/tsaddr"
 	"tailscale.com/net/tsdial"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tailcfg/peercap"
@@ -904,6 +905,8 @@ func (s *Server) start() (reterr error) {
 		HealthTracker: sys.HealthTracker.Get(),
 		ExtraRootCAs:  sys.ExtraRootCAs,
 		Metrics:       sys.UserMetricsRegistry(),
+
+		DNSServiceAddrs: tsaddr.TailscaleServiceAddrs(),
 	})
 	if err != nil {
 		return err

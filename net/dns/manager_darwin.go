@@ -16,7 +16,6 @@ import (
 	"tailscale.com/control/controlknobs"
 	"tailscale.com/health"
 	"tailscale.com/net/dns/resolvconffile"
-	"tailscale.com/net/tsaddr"
 	"tailscale.com/types/logger"
 	"tailscale.com/util/eventbus"
 	"tailscale.com/util/mak"
@@ -235,14 +234,7 @@ func (c *darwinConfigurator) GetBaseConfig() (OSConfig, error) {
 		return cfg, ErrGetBaseConfigNotSupported
 	}
 
-	for _, ns := range resolvConf.Nameservers {
-		if ns == tsaddr.TailscaleServiceIP() || ns == tsaddr.TailscaleServiceIPv6() {
-			// If we find Quad100 in /etc/resolv.conf, we should ignore it
-			c.logf("ignoring 100.100.100.100 resolver IP found in /etc/resolv.conf")
-			continue
-		}
-		cfg.Nameservers = append(cfg.Nameservers, ns)
-	}
+	cfg.Nameservers = resolvConf.Nameservers
 	cfg.SearchDomains = resolvConf.SearchDomains
 
 	if len(cfg.Nameservers) == 0 {

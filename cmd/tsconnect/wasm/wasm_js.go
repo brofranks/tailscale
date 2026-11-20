@@ -34,6 +34,7 @@ import (
 	"tailscale.com/logpolicy"
 	"tailscale.com/logtail"
 	"tailscale.com/net/netns"
+	"tailscale.com/net/tsaddr"
 	"tailscale.com/net/tsdial"
 	"tailscale.com/safesocket"
 	"tailscale.com/tailcfg"
@@ -113,6 +114,8 @@ func newIPN(jsConfig js.Value) map[string]any {
 		ExtraRootCAs:  sys.ExtraRootCAs,
 		Metrics:       sys.UserMetricsRegistry(),
 		EventBus:      sys.Bus.Get(),
+
+		DNSServiceAddrs: tsaddr.TailscaleServiceAddrs(),
 	})
 	if err != nil {
 		log.Fatal(err)

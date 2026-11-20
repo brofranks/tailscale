@@ -9,12 +9,10 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"net/netip"
 	"os/exec"
 	"slices"
 	"strings"
 
-	"tailscale.com/net/tsaddr"
 	"tailscale.com/types/logger"
 )
 
@@ -143,26 +141,7 @@ func (m openresolvManager) GetBaseConfig() (OSConfig, error) {
 	if err != nil {
 		return OSConfig{}, err
 	}
-	cfg, err := readResolv(bytes.NewReader(out))
-	if err != nil {
-		return OSConfig{}, err
-	}
-
-	// Forwarding to the Tailscale service IPs would make quad-100 send
-	// queries to itself, in an infinite loop, so drop them if another
-	// snippet names them. See tailscale/tailscale#7816.
-	var removed bool
-	cfg.Nameservers = slices.DeleteFunc(cfg.Nameservers, func(ip netip.Addr) bool {
-		if ip == tsaddr.TailscaleServiceIP() || ip == tsaddr.TailscaleServiceIPv6() {
-			removed = true
-			return true
-		}
-		return false
-	})
-	if removed {
-		m.logf("[v1] dropped Tailscale service IP from openresolv base config")
-	}
-	return cfg, nil
+	return readResolv(bytes.NewReader(out))
 }
 
 func (m openresolvManager) Close() error {

@@ -18,6 +18,7 @@ import (
 	"tailscale.com/net/tsdial"
 	"tailscale.com/tstest"
 	"tailscale.com/types/dnstype"
+	"tailscale.com/types/views"
 	"tailscale.com/util/dnsname"
 	"tailscale.com/util/eventbus/eventbustest"
 )
@@ -199,6 +200,7 @@ func TestManagerAppleDNSModes(t *testing.T) {
 					m := &Manager{
 						goos:   goos,
 						os:     f,
+						owned:  views.SliceOf(serviceAddr46),
 						knobs:  knobs,
 						health: health.NewTracker(eventbustest.NewBus(t)),
 						logf:   t.Logf,
@@ -290,7 +292,7 @@ func TestAppleBaseConfigWarningRecovery(t *testing.T) {
 				ht := health.NewTracker(bus)
 				dialer := tsdial.NewDialer(netmon.NewStatic())
 				dialer.SetBus(bus)
-				m := NewManager(t.Logf, f, ht, dialer, nil, nil, goos, bus)
+				m := NewManager(t.Logf, f, ht, dialer, nil, nil, goos, bus, serviceAddr46)
 				m.resolver.TestOnlySetHook(f.SetResolver)
 				t.Cleanup(func() { m.Down() })
 				cfg := Config{Routes: upstreams("split.example", "192.0.2.53")}
