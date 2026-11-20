@@ -386,6 +386,15 @@ func (r *linuxRouter) restoreIPRules() {
 	r.justAddIPRules(families)
 }
 
+// IPv6Available reports whether Up selected IPv6 and the router still
+// considers its backend and tunnel usable for IPv6 addresses and routes.
+// Call it after Up succeeds and before Close.
+func (r *linuxRouter) IPv6Available() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return slices.Contains(r.ruleFamilies, v6) && r.getV6Available()
+}
+
 func (r *linuxRouter) Up() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()

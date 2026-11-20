@@ -1783,6 +1783,39 @@ func TestCloseUsesInstalledRuleFamilies(t *testing.T) {
 	}
 }
 
+func TestIPv6Available(t *testing.T) {
+	for _, atUp := range []bool{false, true} {
+		t.Run(fmt.Sprintf("available-at-up=%t", atUp), func(t *testing.T) {
+			r, _ := newTestLinuxRouterBeforeUp(t, logger.Discard)
+			usable := atUp
+			r.interfaceV6Usable = func() bool { return usable }
+			if r.IPv6Available() {
+				t.Fatal("IPv6 available before Up")
+			}
+			if err := r.Up(); err != nil {
+				t.Fatal(err)
+			}
+			for _, now := range []bool{true, false, true} {
+				usable = now
+				if got := r.IPv6Available(); got != (atUp && usable) {
+					t.Fatalf("tunnel usable = %t, IPv6Available = %t", usable, got)
+				}
+			}
+		})
+	}
+
+	t.Run("backend-loss-and-recovery", func(t *testing.T) {
+		r, fake := newTestLinuxRouter(t)
+		backend := fake.nfr.(*fakeIPTablesRunner)
+		for _, available := range []bool{true, false, true} {
+			backend.noV6 = !available
+			if got := r.IPv6Available(); got != available {
+				t.Fatalf("backend HasIPV6 = %t, IPv6Available = %t", available, got)
+			}
+		}
+	})
+}
+
 // TestRuleRepairOverlapsClose verifies that a rule repair already running
 // when Close starts cannot reinstall the rules Close removed.
 func TestRuleRepairOverlapsClose(t *testing.T) {
