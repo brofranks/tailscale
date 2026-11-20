@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"net"
 	"net/netip"
+	"os"
 	"slices"
 	"testing"
 
@@ -427,5 +428,54 @@ func TestEqual(t *testing.T) {
 				t.Errorf("Equal = %v; want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestSetTailscaleInterfaceProps(t *testing.T) {
+	oldName, oldIndex := tsIfProps.tsIfName(), tsIfProps.tsIfIndex()
+	t.Cleanup(func() { tsIfProps.set(oldName, oldIndex) })
+
+	const knownName, deniedName = "known-tun", "denied-tun"
+	var lookups []string
+	tstest.Replace(t, &kernelInterfaceByName, func(name string) (*net.Interface, error) {
+		lookups = append(lookups, name)
+		if name == knownName {
+			return &net.Interface{Name: name, Index: 7}, nil
+		}
+		return nil, os.ErrPermission
+	})
+	tstest.Replace(t, &altNetInterfaces, func() ([]Interface, error) {
+		return []Interface{
+			{Interface: &net.Interface{Name: knownName, Index: 42}},
+			{Interface: &net.Interface{Name: deniedName, Index: 43}},
+		}, nil
+	})
+
+	SetTailscaleInterfaceProps(knownName, 0)
+	if index, err := TailscaleInterfaceIndex(); err != nil || index != 7 {
+		t.Fatalf("kernel index = %d, %v, want 7", index, err)
+	}
+
+	SetTailscaleInterfaceProps(deniedName, 0)
+	if got, err := TailscaleInterfaceName(); err != nil || got != deniedName {
+		t.Fatalf("name after failed lookup = %q, %v, want %q", got, err, deniedName)
+	}
+	if index, err := TailscaleInterfaceIndex(); err == nil || index != 0 {
+		t.Fatalf("index after failed lookup = %d, %v, want unknown", index, err)
+	}
+
+	SetTailscaleInterfaceProps(knownName, 9)
+	if index, err := TailscaleInterfaceIndex(); err != nil || index != 9 {
+		t.Fatalf("explicit index = %d, %v, want 9", index, err)
+	}
+	SetTailscaleInterfaceProps("", 0)
+	if _, err := TailscaleInterfaceName(); err == nil {
+		t.Error("name still registered after removal")
+	}
+	if index, err := TailscaleInterfaceIndex(); err == nil || index != 0 {
+		t.Errorf("index after removal = %d, %v, want unknown", index, err)
+	}
+	if want := []string{knownName, deniedName}; !slices.Equal(lookups, want) {
+		t.Errorf("kernel lookups = %q, want %q", lookups, want)
 	}
 }
