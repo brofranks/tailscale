@@ -8,10 +8,12 @@ import (
 	"math/rand"
 	"net/netip"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
 	"golang.zx2c4.com/wireguard/windows/tunnel/winipcfg"
+	"tailscale.com/net/tsaddr"
 )
 
 func randIP() netip.Addr {
@@ -168,40 +170,72 @@ func ipnet4(ip string, bits int) netip.Prefix {
 }
 
 func TestFilterRoutes(t *testing.T) {
-	var h0 netip.Addr
-
-	in := []*routeData{
-		// LinkLocal and Loopback routes.
-		{RouteData: W{ipnet4("169.254.0.0", 16), h0, 1}},
-		{RouteData: W{ipnet4("169.254.255.255", 32), h0, 1}},
-		{RouteData: W{ipnet4("127.0.0.0", 8), h0, 1}},
-		{RouteData: W{ipnet4("127.255.255.255", 32), h0, 1}},
-		// Local LAN routes.
-		{RouteData: W{ipnet4("192.168.0.0", 24), h0, 1}},
-		{RouteData: W{ipnet4("192.168.0.255", 32), h0, 1}},
-		{RouteData: W{ipnet4("192.168.1.0", 25), h0, 1}},
-		{RouteData: W{ipnet4("192.168.1.127", 32), h0, 1}},
-		// Some random other route.
-		{RouteData: W{ipnet4("192.168.2.23", 32), h0, 1}},
-		// Our own tailscale address.
-		{RouteData: W{ipnet4("100.100.100.100", 32), h0, 1}},
-		// Other tailscale addresses.
-		{RouteData: W{ipnet4("100.100.100.101", 32), h0, 1}},
-		{RouteData: W{ipnet4("100.100.100.102", 32), h0, 1}},
+	const (
+		local  = winipcfg.RouteProtocolLocal
+		static = winipcfg.RouteProtocolNetMgmt
+	)
+	route := func(prefix, hop string, proto winipcfg.RouteProtocol) *routeData {
+		return &routeData{
+			RouteData: W{
+				Destination: netip.MustParsePrefix(prefix),
+				NextHop:     netip.MustParseAddr(hop),
+			},
+			Row: &winipcfg.MibIPforwardRow2{Protocol: proto},
+		}
+	}
+	assigned := mustCIDRs("100.64.0.16/32", "192.0.2.17/24", "fd42::10/128", "fd42::21/64")
+	kernel := []*routeData{
+		// Link-local and loopback broadcast routes.
+		route("169.254.255.255/32", "0.0.0.0", local),
+		route("127.255.255.255/32", "0.0.0.0", local),
+		// Hosts, connected subnets and broadcast routes for local addresses.
+		route("100.64.0.16/32", "0.0.0.0", local),
+		route("192.0.2.17/32", "0.0.0.0", local),
+		route("192.0.2.0/24", "0.0.0.0", local),
+		route("192.0.2.255/32", "0.0.0.0", local),
+		route("fd42::10/128", "::", local),
+		route("fd42::21/128", "::", local),
+		route("fd42::/64", "::", local),
 	}
 	want := []*routeData{
-		{RouteData: W{ipnet4("169.254.0.0", 16), h0, 1}},
-		{RouteData: W{ipnet4("127.0.0.0", 8), h0, 1}},
-		{RouteData: W{ipnet4("192.168.0.0", 24), h0, 1}},
-		{RouteData: W{ipnet4("192.168.1.0", 25), h0, 1}},
-		{RouteData: W{ipnet4("192.168.2.23", 32), h0, 1}},
-		{RouteData: W{ipnet4("100.100.100.101", 32), h0, 1}},
-		{RouteData: W{ipnet4("100.100.100.102", 32), h0, 1}},
+		// A routed subnet and a peer at its last address in each family.
+		route("100.64.0.16/28", "100.100.100.100", static),
+		route("100.64.0.31/32", "0.0.0.0", static),
+		route("fd42::10/124", "fd7a:115c:a1e0::53", static),
+		route("fd42::1f/128", "fd7a:115c:a1e0::53", static),
+		// A static route can share a prefix with a connected route.
+		route("192.0.2.0/24", "100.100.100.100", static),
 	}
 
-	got := filterRoutes(in, mustCIDRs("100.100.100.100/32"))
-	if !equalRouteDatas(got, want) {
-		t.Errorf("\ngot:  %v\n  want: %v\n", formatRouteData(got), formatRouteData(want))
+	got := filterRoutes(slices.Concat(kernel, want), assigned)
+	add, del := deltaRouteData(got, want)
+	if len(add) != 0 || len(del) != 0 {
+		t.Errorf("repeat sync: add %v, delete %v", formatRouteData(add), formatRouteData(del))
+	}
+
+	// Unassigned subnets and withdrawn peer routes are still deletable.
+	stale := []*routeData{
+		route("169.254.0.0/16", "0.0.0.0", local),
+		route("127.0.0.0/8", "0.0.0.0", local),
+	}
+	got = filterRoutes(slices.Concat(kernel, want, stale), assigned)
+	_, del = deltaRouteData(got, nil)
+	wantDel := slices.Concat(want, stale)
+	slices.SortFunc(wantDel, (*routeData).Compare)
+	if !equalRouteDatas(del, wantDel) {
+		t.Errorf("withdraw routes: delete %v, want %v", formatRouteData(del), formatRouteData(wantDel))
+	}
+
+	// An IPv4-only configuration with IPv6 routes gains a local IPv6 address.
+	ip := tsaddr.Tailscale4To6Placeholder()
+	placeholder := netip.PrefixFrom(ip, ip.BitLen())
+	got = filterRoutes(
+		[]*routeData{route(placeholder.String(), "::", local)},
+		[]netip.Prefix{placeholder},
+	)
+	_, del = deltaRouteData(got, nil)
+	if len(del) != 0 {
+		t.Errorf("delete IPv6 placeholder: %v", formatRouteData(del))
 	}
 }
 

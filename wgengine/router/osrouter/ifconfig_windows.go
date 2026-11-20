@@ -23,7 +23,6 @@ import (
 
 	ole "github.com/go-ole/go-ole"
 	"github.com/tailscale/wireguard-go/tun"
-	"go4.org/netipx"
 	"golang.org/x/sys/windows"
 	"golang.zx2c4.com/wireguard/windows/tunnel/winipcfg"
 )
@@ -336,7 +335,6 @@ func configureInterface(cfg *router.Config, tun *tun.NativeTun, ht *health.Track
 	// routes from being marked as on-link. We can still create on-link routes
 	// for single-host Tailscale routes, but we shouldn't attempt to create a
 	// route for the interface's own IP.
-	var localAddr4, localAddr6 netip.Addr
 	var gatewayAddr4, gatewayAddr6 netip.Addr
 	addresses := make([]netip.Prefix, 0, len(cfg.LocalAddrs))
 	for _, addr := range cfg.LocalAddrs {
@@ -346,10 +344,8 @@ func configureInterface(cfg *router.Config, tun *tun.NativeTun, ht *health.Track
 		}
 		addresses = append(addresses, addr)
 		if addr.Addr().Is4() && !gatewayAddr4.IsValid() {
-			localAddr4 = addr.Addr()
 			gatewayAddr4 = tsaddr.TailscaleServiceIP()
 		} else if addr.Addr().Is6() && !gatewayAddr6.IsValid() {
-			localAddr6 = addr.Addr()
 			gatewayAddr6 = tsaddr.TailscaleServiceIPv6()
 		}
 	}
@@ -378,31 +374,14 @@ func configureInterface(cfg *router.Config, tun *tun.NativeTun, ht *health.Track
 			return errors.New("due to a Windows limitation, one cannot have interface routes without an interface address")
 		}
 
-		var gateway, localAddr netip.Addr
-		if route.Addr().Is4() {
-			localAddr = localAddr4
-			gateway = gatewayAddr4
-		} else if route.Addr().Is6() {
-			localAddr = localAddr6
+		gateway := gatewayAddr4
+		if route.Addr().Is6() {
 			gateway = gatewayAddr6
 		}
 
-		switch destAddr := route.Addr().Unmap(); {
-		case destAddr == localAddr:
-			// no need to add a route for the interface's
-			// own IP. The kernel does that for us.
-			// If we try to replace it, we'll fail to
-			// add the route unless NextHop is set, but
-			// then the interface's IP won't be pingable.
+		gateway = windowsRouteNextHop(route, gateway, addresses)
+		if !gateway.IsValid() {
 			continue
-		case route.IsSingleIP() && (destAddr == gateway || tsaddr.IsTailscaleIP(destAddr)):
-			// add an on-link route if the destination
-			// is the nexthop itself or a single Tailscale IP.
-			if route.Addr().Is4() {
-				gateway = netip.IPv4Unspecified()
-			} else {
-				gateway = netip.IPv6Unspecified()
-			}
 		}
 
 		r := &routeData{
@@ -455,7 +434,7 @@ func configureInterface(cfg *router.Config, tun *tun.NativeTun, ht *health.Track
 	}
 
 	var errAcc error
-	err = syncRoutes(iface, deduplicatedRoutes, cfg.LocalAddrs)
+	err = syncRoutes(iface, deduplicatedRoutes, addresses)
 	if err != nil && errAcc == nil {
 		log.Printf("setroutes: %v", err)
 		errAcc = err
@@ -759,48 +738,34 @@ func getAllInterfaceRoutes(ifc *winipcfg.IPAdapterAddresses) ([]*routeData, erro
 	return rd, nil
 }
 
-// filterRoutes removes routes that have been added by Windows and should not
-// be managed by us.
-func filterRoutes(routes []*routeData, dontDelete []netip.Prefix) []*routeData {
-	ddm := make(map[netip.Prefix]bool)
-	for _, dd := range dontDelete {
-		// See issue 1448: we don't want to touch the routes added
-		// by Windows for our interface addresses.
-		ddm[dd] = true
-	}
-	for _, r := range routes {
-		// We don't want to touch broadcast routes that Windows adds.
-		nr := r.Destination
-		if !nr.IsValid() {
-			continue
+// filterRoutes excludes local host routes and connected routes for assigned
+// subnets from the installed rows.
+func filterRoutes(routes []*routeData, assigned []netip.Prefix) []*routeData {
+	return slices.DeleteFunc(routes, func(r *routeData) bool {
+		if r.Row.Protocol != winipcfg.RouteProtocolLocal {
+			return false
 		}
-		if nr.IsSingleIP() {
-			continue
-		}
-		lastIP := netipx.RangeOfPrefix(nr).To()
-		ddm[netip.PrefixFrom(lastIP, lastIP.BitLen())] = true
-	}
-	filtered := make([]*routeData, 0, len(routes))
-	for _, r := range routes {
-		rr := r.Destination
-		if rr.IsValid() && ddm[rr] {
-			continue
-		}
-		filtered = append(filtered, r)
-	}
-	return filtered
+		// Windows adds host routes for interface addresses (issue 1448) and
+		// IPv4 broadcasts, and connected routes for assigned subnets.
+		return r.Destination.IsSingleIP() ||
+			slices.ContainsFunc(assigned, func(addr netip.Prefix) bool {
+				return r.Destination == addr.Masked()
+			})
+	})
 }
 
-// syncRoutes incrementally sets multiples routes on an interface.
+// syncRoutes incrementally sets routes on an interface.
 // This avoids a full ifc.FlushRoutes call.
-// dontDelete is a list of interface address routes that the
-// synchronization logic should never delete.
-func syncRoutes(ifc *winipcfg.IPAdapterAddresses, want []*routeData, dontDelete []netip.Prefix) error {
+func syncRoutes(
+	ifc *winipcfg.IPAdapterAddresses,
+	want []*routeData,
+	assigned []netip.Prefix,
+) error {
 	existingRoutes, err := getAllInterfaceRoutes(ifc)
 	if err != nil {
 		return err
 	}
-	got := filterRoutes(existingRoutes, dontDelete)
+	got := filterRoutes(existingRoutes, assigned)
 
 	add, del := deltaRouteData(got, want)
 
