@@ -1,0 +1,1186 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Brody Franks <brody@franks.id.au>
+Date: Thu, 19 Nov 2026 20:02:25 -0800
+Subject: [PATCH] wgengine: clean up when NewUserspaceEngine fails
+
+NewUserspaceEngine deferred cleanup while the resource list was still
+empty. A failed start could leave the TUN, UDP sockets and Linux policy
+rules behind.
+
+Read the final list on rollback. Close the router before the device and
+release the owned network monitor, DNS manager and BIRD client. Start
+the WireGuard shutdown watcher only once the engine is complete. Return
+the startup error first, followed by any errors from cleanup in order.
+
+On Linux, record the rule families claimed at startup. Repair only
+claimed families that are still usable. Drain router event handlers
+before taking the router lock and serialize rule repair with teardown.
+The first Close attempts every teardown step, even if the interface
+cannot be brought down. Release the claim after that attempt so later
+closes leave a replacement interface and its rules alone.
+
+On Windows, clear the firewall only if this router requested firewall
+work. On FreeBSD, build the NAT rules before installing references to
+the shared anchor. Track cleanup from the first attempted anchor load.
+A partial load or failed removal gets one final attempt at close.
+
+Change-Id: I913286a95a245286eeab14ddaaa8d77e361a5e11
+Signed-off-by: Brody Franks <brody@franks.id.au>
+---
+ wgengine/router/osrouter/router_freebsd.go      |  31 ++-
+ wgengine/router/osrouter/router_freebsd_test.go |  63 ++++++
+ wgengine/router/osrouter/router_linux.go        | 106 +++++----
+ wgengine/router/osrouter/router_linux_test.go   | 288 +++++++++++++++++++++++-
+ wgengine/router/osrouter/router_windows.go      |  15 +-
+ wgengine/router/osrouter/router_windows_test.go |  10 +
+ wgengine/userspace.go                           |  83 ++++---
+ wgengine/userspace_test.go                      | 136 +++++++++++
+ 8 files changed, 641 insertions(+), 91 deletions(-)
+
+diff --git a/wgengine/router/osrouter/router_freebsd.go b/wgengine/router/osrouter/router_freebsd.go
+index fde14b97421d210361ca0dbdaa3ed5c6be589522..d0f319064d0fb1902da86b7591c96035ffa215e6 100644
+--- a/wgengine/router/osrouter/router_freebsd.go
++++ b/wgengine/router/osrouter/router_freebsd.go
+@@ -34,7 +34,8 @@ func init() {
+ type freebsdRouter struct {
+ 	*userspaceBSDRouter
+ 	kernelSubnets    bool // kernel, not netstack, forwards subnet traffic
+-	snatSubnetRoutes bool // PF NAT rules are installed
++	snatSubnetRoutes bool // last requested SNAT setting
++	pfNeedsCleanup   bool // this router owns cleanup for an attempted anchor load
+ }
+ 
+ func newFreeBSDRouter(logf logger.Logf, tundev tun.Device, netMon *netmon.Monitor, health *health.Tracker) (router.Router, error) {
+@@ -82,10 +83,12 @@ func (r *freebsdRouter) Set(cfg *router.Config) (reterr error) {
+ 			r.logf("adding PF NAT rules: %v", err)
+ 			setErr(err)
+ 		}
+-	default:
++	case r.pfNeedsCleanup:
+ 		if err := r.delPFNATRules(); err != nil {
+ 			r.logf("removing PF NAT rules: %v", err)
+ 			setErr(err)
++		} else {
++			r.pfNeedsCleanup = false
+ 		}
+ 	}
+ 	r.snatSubnetRoutes = wantSNAT
+@@ -109,6 +112,8 @@ func (r *freebsdRouter) enableIPForwarding() {
+ // configuration; we only ever flush or modify rules inside this anchor.
+ const pfAnchorName = "tailscale"
+ 
++var pfListInterfaces = net.Interfaces
++
+ // addPFNATRules configures PF to masquerade traffic from Tailscale addresses
+ // leaving via non-Tailscale interfaces. This is the FreeBSD equivalent of the
+ // Linux iptables MASQUERADE rule used for subnet routing.
+@@ -122,13 +127,6 @@ func (r *freebsdRouter) addPFNATRules() error {
+ 	// Enable PF (idempotent; returns error if already enabled).
+ 	cmd("pfctl", "-e").CombinedOutput()
+ 
+-	// Ensure the main ruleset references our anchor so PF evaluates it.
+-	// We add both a nat-anchor (for NAT rules) and an anchor (for filter
+-	// rules, currently just "pass" to avoid blocking) if not already present.
+-	if err := ensurePFAnchorRef(); err != nil {
+-		return fmt.Errorf("ensuring PF anchor reference: %w", err)
+-	}
+-
+ 	// Load rules into the tailscale anchor.
+ 	// Traffic from Tailscale CGNAT (100.64.0.0/10) or ULA (fd7a:115c:a1e0::/48)
+ 	// addresses exiting any non-Tailscale interface is source-NATed to the
+@@ -148,8 +146,16 @@ func (r *freebsdRouter) addPFNATRules() error {
+ 		return fmt.Errorf("building PF NAT rules: %w", err)
+ 	}
+ 
++	// Ensure the main ruleset references our anchor so PF evaluates it.
++	// We add both a nat-anchor (for NAT rules) and an anchor (for filter
++	// rules, currently just "pass" to avoid blocking) if not already present.
++	if err := ensurePFAnchorRef(); err != nil {
++		return fmt.Errorf("ensuring PF anchor reference: %w", err)
++	}
++
+ 	pfctl := exec.Command("pfctl", "-a", pfAnchorName, "-f", "-")
+ 	pfctl.Stdin = strings.NewReader(rules)
++	r.pfNeedsCleanup = true
+ 	out, err := pfctl.CombinedOutput()
+ 	if err != nil {
+ 		return fmt.Errorf("pfctl -a %s -f: %v (%s)", pfAnchorName, err, strings.TrimSpace(string(out)))
+@@ -166,7 +172,7 @@ func (r *freebsdRouter) addPFNATRules() error {
+ // The interface set is sampled when SNAT is enabled; interfaces added later
+ // are not covered until SNAT is toggled or tailscaled restarts.
+ func (r *freebsdRouter) buildPFNATRules() (string, error) {
+-	ifaces, err := net.Interfaces()
++	ifaces, err := pfListInterfaces()
+ 	if err != nil {
+ 		return "", err
+ 	}
+@@ -369,7 +375,10 @@ func (r *freebsdRouter) Close() error {
+ 	// Don't destroy the interface here: this process still holds the tun
+ 	// open, and FreeBSD's tun(4) blocks destroy until the last close, which
+ 	// deadlocks shutdown. The next startup's cleanUp destroys leftovers.
+-	cleanUpPF(r.logf)
++	if r.pfNeedsCleanup {
++		r.pfNeedsCleanup = false
++		cleanUpPF(r.logf)
++	}
+ 	return nil
+ }
+ 
+diff --git a/wgengine/router/osrouter/router_freebsd_test.go b/wgengine/router/osrouter/router_freebsd_test.go
+index 054632feb2c01dd3f087a767b582cd463abf111f..3f7dff4217d514c2bb5937754a92488939d22d65 100644
+--- a/wgengine/router/osrouter/router_freebsd_test.go
++++ b/wgengine/router/osrouter/router_freebsd_test.go
+@@ -4,10 +4,73 @@
+ package osrouter
+ 
+ import (
++	"errors"
++	"net"
++	"net/netip"
++	"os"
++	"path/filepath"
+ 	"slices"
+ 	"testing"
++
++	"tailscale.com/tstest"
++	"tailscale.com/wgengine/router"
+ )
+ 
++func TestPFEnumerationFailurePreservesAnchor(t *testing.T) {
++	listErr := errors.New("interface list unavailable")
++	tstest.Replace(t, &pfListInterfaces, func() ([]net.Interface, error) { return nil, listErr })
++	const command = `#!/bin/sh
++case "$*" in
++    "-f -") /bin/cat > main-rules ;;
++    "-a tailscale -f -") /bin/cat > anchor ;;
++    "-a tailscale -F all") : > anchor ;;
++esac
++`
++	bin := t.TempDir()
++	t.Setenv("PATH", bin)
++	for _, name := range []string{"pfctl", "kldload", "sysctl"} {
++		if err := os.WriteFile(filepath.Join(bin, name), []byte(command), 0700); err != nil {
++			t.Fatal(err)
++		}
++	}
++
++	for _, tc := range []struct{ name, anchor string }{
++		{"empty", ""},
++		{"populated", "pass out all\n"},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			t.Chdir(t.TempDir())
++			if err := os.WriteFile("anchor", []byte(tc.anchor), 0600); err != nil {
++				t.Fatal(err)
++			}
++			r := &freebsdRouter{
++				userspaceBSDRouter: &userspaceBSDRouter{logf: t.Logf, tunname: "tun0"},
++				kernelSubnets:      true,
++			}
++			cfg := &router.Config{
++				SubnetRoutes:     []netip.Prefix{netip.MustParsePrefix("192.0.2.0/24")},
++				SNATSubnetRoutes: true,
++			}
++			if err := r.Set(cfg); !errors.Is(err, listErr) {
++				t.Fatalf("enable SNAT = %v, want %v", err, listErr)
++			}
++			if err := r.Set(nil); err != nil {
++				t.Fatal(err)
++			}
++			if err := r.Close(); err != nil {
++				t.Fatal(err)
++			}
++			if got, err := os.ReadFile("main-rules"); !errors.Is(err, os.ErrNotExist) {
++				t.Errorf("main PF ruleset write = %q, %v, want no write", got, err)
++			}
++			got, err := os.ReadFile("anchor")
++			if err != nil || string(got) != tc.anchor {
++				t.Errorf("anchor = %q, %v, want %q", got, err, tc.anchor)
++			}
++		})
++	}
++}
++
+ func TestPFTablesReferenced(t *testing.T) {
+ 	tests := []struct {
+ 		name  string
+diff --git a/wgengine/router/osrouter/router_linux.go b/wgengine/router/osrouter/router_linux.go
+index c8b31d00e7984145c2d6c7f44a28f572d7ad3509..bc2562a281ed61140341e9b09d2006214915d4a9 100644
+--- a/wgengine/router/osrouter/router_linux.go
++++ b/wgengine/router/osrouter/router_linux.go
+@@ -89,8 +89,8 @@ type linuxRouter struct {
+ 	// interfaceV6UsableMemo memoizes interfaceV6Usable for the duration of a
+ 	// single Set, so its many getV6Available calls don't each hit /proc. It's
+ 	// an atomic tri-state (see the memoV6 constants) because getV6Available is
+-	// also reached, without holding mu, from the onIPRuleDeleted timer's
+-	// justAddIPRules; the unset value there means "read live". See #20447.
++	// also reached outside Set, from the onIPRuleDeleted timer's rule repair;
++	// the unset value there means "read live". See #20447.
+ 	interfaceV6UsableMemo atomic.Int32
+ 
+ 	// ipPolicyPrefBase is the base priority at which ip rules are installed.
+@@ -99,6 +99,11 @@ type linuxRouter struct {
+ 	cmd commandRunner
+ 	nfr linuxfw.NetfilterRunner
+ 
++	// ruleFamilies records the families claimed by Up, under mu. A repair
++	// can run after IPv6 appears, and Close can run after it disappears.
++	// A nil slice means the router has no claim on those families.
++	ruleFamilies []addrFamily
++
+ 	mu                sync.Mutex
+ 	addrs             map[netip.Prefix]bool
+ 	lastScanAddrs     set.Set[netip.Prefix] // desired addrs at the last successful orphan scan; nil until the first scan
+@@ -359,12 +364,26 @@ func (r *linuxRouter) onIPRuleDeleted(table uint8, priority uint32) {
+ 
+ 	r.rulesAddedPub.Publish(AddIPRules{})
+ 
+-	time.AfterFunc(rr.Delay()+250*time.Millisecond, func() {
+-		if r.ruleRestorePending.Swap(false) && !r.closed.Load() {
+-			r.logf("somebody (likely systemd-networkd) deleted ip rules; restoring Tailscale's")
+-			r.justAddIPRules()
+-		}
+-	})
++	time.AfterFunc(rr.Delay()+250*time.Millisecond, r.restoreIPRules)
++}
++
++func (r *linuxRouter) restoreIPRules() {
++	if !r.ruleRestorePending.Swap(false) || r.closed.Load() {
++		return
++	}
++	r.logf("somebody (likely systemd-networkd) deleted ip rules; restoring Tailscale's")
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	// Close can start after the timer fires. Serialize its final removal
++	// with these writes, including the check that this router is active.
++	if r.closed.Load() || r.ruleFamilies == nil {
++		return
++	}
++	families := r.ruleFamilies
++	if len(families) == 2 && !r.getV6Available() {
++		families = families[:1] // IPv4 is always first.
++	}
++	r.justAddIPRules(families)
+ }
+ 
+ func (r *linuxRouter) Up() error {
+@@ -373,7 +392,8 @@ func (r *linuxRouter) Up() error {
+ 	if err := r.setNetfilterModeLocked(netfilterOff); err != nil {
+ 		return fmt.Errorf("setting netfilter mode: %w", err)
+ 	}
+-	if err := r.addIPRules(); err != nil {
++	r.ruleFamilies = r.addrFamilies()
++	if err := r.addIPRules(r.ruleFamilies); err != nil {
+ 		return fmt.Errorf("adding IP rules: %w", err)
+ 	}
+ 	if err := r.upInterface(); err != nil {
+@@ -384,37 +404,45 @@ func (r *linuxRouter) Up() error {
+ }
+ 
+ func (r *linuxRouter) Close() error {
++	// Drain event handlers before taking r.mu because they take it too.
++	// Concurrent closes must all wait for the same drain.
++	if !r.closed.Swap(true) {
++		r.eventClient.Close()
++	}
++	<-r.eventClient.Done()
+ 	r.mu.Lock()
+ 	defer r.mu.Unlock()
+-	r.closed.Store(true)
+ 	if r.unregNetMon != nil {
+ 		r.unregNetMon()
++		r.unregNetMon = nil
+ 	}
+-	r.eventClient.Close()
+ 
+-	// Clean up connmark rules
+-	if err := r.nfr.DelConnmarkSaveRule(); err != nil {
+-		r.logf("warning: failed to delete connmark rules: %v", err)
++	if r.ruleFamilies == nil {
++		return nil
+ 	}
+ 
+-	if err := r.downInterface(); err != nil {
+-		return err
+-	}
+-	if err := r.delIPRules(); err != nil {
+-		return err
+-	}
+-	if err := r.setNetfilterModeLocked(netfilterOff); err != nil {
+-		return err
+-	}
+-	if err := r.delRoutes(); err != nil {
+-		return err
++	// Clean up connmark rules. r.nfr is nil if Set failed to replace it.
++	if r.nfr != nil {
++		if err := r.nfr.DelConnmarkSaveRule(); err != nil {
++			r.logf("warning: failed to delete connmark rules: %v", err)
++		}
+ 	}
+ 
++	// Close may follow a partial Up, so every step runs even if an earlier
++	// one fails.
++	err := errors.Join(
++		r.downInterface(),
++		r.delIPRules(r.ruleFamilies),
++		r.setNetfilterModeLocked(netfilterOff),
++		r.delRoutes(),
++	)
++
++	r.ruleFamilies = nil
+ 	r.addrs = nil
+ 	r.routes = nil
+ 	r.localRoutes = nil
+ 
+-	return nil
++	return err
+ }
+ 
+ // setupNetfilterLocked initializes the NetfilterRunner in r.nfr. It expects r.nfr
+@@ -1502,18 +1530,18 @@ func (r *linuxRouter) addrFamilies() []addrFamily {
+ // addIPRules adds the policy routing rule that avoids tailscaled
+ // routing loops. If the rule exists and appears to be a
+ // tailscale-managed rule, it is gracefully replaced.
+-func (r *linuxRouter) addIPRules() error {
++func (r *linuxRouter) addIPRules(families []addrFamily) error {
+ 	if !r.ipRuleAvailable {
+ 		return nil
+ 	}
+ 
+ 	// Clear out old rules. After that, any error adding a rule is fatal,
+ 	// because there should be no reason we add a duplicate.
+-	if err := r.delIPRules(); err != nil {
++	if err := r.delIPRules(families); err != nil {
+ 		return err
+ 	}
+ 
+-	return r.justAddIPRules()
++	return r.justAddIPRules(families)
+ }
+ 
+ // RouteTable is a Linux routing table: both its name and number.
+@@ -1656,15 +1684,15 @@ func ipRules() []netlink.Rule {
+ }
+ 
+ // justAddIPRules adds policy routing rule without deleting any first.
+-func (r *linuxRouter) justAddIPRules() error {
++func (r *linuxRouter) justAddIPRules(families []addrFamily) error {
+ 	if !r.ipRuleAvailable {
+ 		return nil
+ 	}
+ 	if r.useIPCommand() {
+-		return r.addIPRulesWithIPCommand()
++		return r.addIPRulesWithIPCommand(families)
+ 	}
+ 	var errAcc error
+-	for _, family := range r.addrFamilies() {
++	for _, family := range families {
+ 		for _, ru := range ipRules() {
+ 			// Note: r is a value type here; safe to mutate it.
+ 			ru.Family = family.netlinkInt()
+@@ -1690,10 +1718,10 @@ func (r *linuxRouter) justAddIPRules() error {
+ 	return errAcc
+ }
+ 
+-func (r *linuxRouter) addIPRulesWithIPCommand() error {
++func (r *linuxRouter) addIPRulesWithIPCommand(families []addrFamily) error {
+ 	rg := newRunGroup(nil, r.cmd)
+ 
+-	for _, family := range r.addrFamilies() {
++	for _, family := range families {
+ 		for _, rule := range ipRules() {
+ 			args := []string{
+ 				"ip", family.dashArg(),
+@@ -1733,15 +1761,15 @@ func (r *linuxRouter) delRoutes() error {
+ 
+ // delIPRules removes the policy routing rules that avoid
+ // tailscaled routing loops, if it exists.
+-func (r *linuxRouter) delIPRules() error {
++func (r *linuxRouter) delIPRules(families []addrFamily) error {
+ 	if !r.ipRuleAvailable {
+ 		return nil
+ 	}
+ 	if r.useIPCommand() {
+-		return r.delIPRulesWithIPCommand()
++		return r.delIPRulesWithIPCommand(families)
+ 	}
+ 	var errAcc error
+-	for _, family := range r.addrFamilies() {
++	for _, family := range families {
+ 		for _, ru := range ipRules() {
+ 			// Note: r is a value type here; safe to mutate it.
+ 			// When deleting rules, we want to be a bit specific (mention which
+@@ -1770,7 +1798,7 @@ func (r *linuxRouter) delIPRules() error {
+ 	return errAcc
+ }
+ 
+-func (r *linuxRouter) delIPRulesWithIPCommand() error {
++func (r *linuxRouter) delIPRulesWithIPCommand(families []addrFamily) error {
+ 	// Error codes: 'ip rule' returns error code 2 if the rule is a
+ 	// duplicate (add) or not found (del). It returns a different code
+ 	// for syntax errors. This is also true of busybox.
+@@ -1779,7 +1807,7 @@ func (r *linuxRouter) delIPRulesWithIPCommand() error {
+ 	// unknown rules during deletion.
+ 	rg := newRunGroup([]int{2, 254}, r.cmd)
+ 
+-	for _, family := range r.addrFamilies() {
++	for _, family := range families {
+ 		// When deleting rules, we want to be a bit specific (mention which
+ 		// table we were routing to) but not *too* specific (fwmarks, etc).
+ 		// That leaves us some flexibility to change these values in later
+diff --git a/wgengine/router/osrouter/router_linux_test.go b/wgengine/router/osrouter/router_linux_test.go
+index efa2bd358288468287e8e28a6600c163bc1eee0c..af22d32f7827c08dbfba682b319d4ed2244dae17 100644
+--- a/wgengine/router/osrouter/router_linux_test.go
++++ b/wgengine/router/osrouter/router_linux_test.go
+@@ -11,12 +11,14 @@ import (
+ 	"os"
+ 	"reflect"
+ 	"regexp"
++	"runtime"
+ 	"slices"
+ 	"sort"
+ 	"strings"
+ 	"sync"
+ 	"sync/atomic"
+ 	"testing"
++	"testing/synctest"
+ 
+ 	"github.com/google/go-cmp/cmp"
+ 	"github.com/tailscale/netlink"
+@@ -1023,6 +1025,8 @@ type fakeOS struct {
+ 	ips    []string
+ 	routes []string
+ 	rules  []string
++	// downErr, if set, is returned when the interface is brought down.
++	downErr error
+ 	// This test tests on the router level, so we will not bother
+ 	// with using iptables or nftables, chose the simpler one.
+ 	nfr linuxfw.NetfilterRunner
+@@ -1114,6 +1118,9 @@ func (o *fakeOS) run(args ...string) error {
+ 		case "set dev tailscale0 up":
+ 			o.up = true
+ 		case "set dev tailscale0 down":
++			if o.downErr != nil {
++				return o.downErr
++			}
+ 			o.up = false
+ 		default:
+ 			return unexpected()
+@@ -1146,7 +1153,12 @@ func (o *fakeOS) run(args ...string) error {
+ 	case "del":
+ 		found := false
+ 		for i, el := range *ls {
+-			if el == rest {
++			// The rule deletion specifies family, priority and action. The
++			// kernel also matches entries with omitted source or mark selectors.
++			matchRule := args[1] == "rule" && len(args) == 7 && args[3] == "pref" &&
++				strings.HasPrefix(el, family+" pref "+args[4]+" ") &&
++				strings.HasSuffix(el, " "+args[5]+" "+args[6])
++			if el == rest || matchRule {
+ 				found = true
+ 				*ls = append((*ls)[:i], (*ls)[i+1:]...)
+ 				break
+@@ -1333,9 +1345,10 @@ func TestAddRemoveRules(t *testing.T) {
+ 	defer lt.Close()
+ 	r := lt.r
+ 
+-	step := func(name string, f func() error) {
++	families := r.addrFamilies()
++	step := func(name string, f func([]addrFamily) error) {
+ 		t.Logf("Doing %v ...", name)
+-		if err := f(); err != nil {
++		if err := f(families); err != nil {
+ 			t.Fatalf("%s: %v", name, err)
+ 		}
+ 		rules, err := netlink.RuleList(netlink.FAMILY_ALL)
+@@ -1655,6 +1668,15 @@ func TestSetSkipsNetfilterAddonsWhenSetupFails(t *testing.T) {
+ // newTestLinuxRouter builds a linuxRouter backed by a fakeOS, brought up and
+ // ready for Set, mirroring TestSetSkipsNetfilterAddonsWhenSetupFails.
+ func newTestLinuxRouter(t *testing.T) (*linuxRouter, *fakeOS) {
++	t.Helper()
++	lr, fake := newTestLinuxRouterBeforeUp(t, logger.Discard)
++	if err := lr.Up(); err != nil {
++		t.Fatalf("Up: %v", err)
++	}
++	return lr, fake
++}
++
++func newTestLinuxRouterBeforeUp(t *testing.T, logf logger.Logf) (*linuxRouter, *fakeOS) {
+ 	t.Helper()
+ 	bus := eventbus.New()
+ 	t.Cleanup(bus.Close)
+@@ -1667,7 +1689,7 @@ func newTestLinuxRouter(t *testing.T) (*linuxRouter, *fakeOS) {
+ 
+ 	fake := NewFakeOS(t)
+ 	ht := health.NewTracker(bus)
+-	r, err := newUserspaceRouterAdvanced(logger.Discard, "tailscale0", mon, fake, ht, bus)
++	r, err := newUserspaceRouterAdvanced(logf, "tailscale0", mon, fake, ht, bus)
+ 	if err != nil {
+ 		t.Fatalf("newUserspaceRouterAdvanced: %v", err)
+ 	}
+@@ -1676,13 +1698,265 @@ func newTestLinuxRouter(t *testing.T) (*linuxRouter, *fakeOS) {
+ 	// Keep the fake netfilter runner's HasIPV6 (noV6) the sole v6 signal;
+ 	// don't consult the live /proc for the tun's IPv6 state. See #20447.
+ 	lr.interfaceV6Usable = func() bool { return true }
+-	if err := lr.Up(); err != nil {
+-		t.Fatalf("Up: %v", err)
+-	}
+ 	t.Cleanup(func() { lr.Close() })
+ 	return lr, fake
+ }
+ 
++// TestCloseWithoutNetfilter verifies that Close on a router whose netfilter
++// setup failed during Up, leaving it without a runner, does not panic and
++// leaves alone the policy rules that Up never reached.
++func TestCloseWithoutNetfilter(t *testing.T) {
++	bus := eventbus.New()
++	defer bus.Close()
++	mon, err := netmon.New(bus, logger.Discard)
++	if err != nil {
++		t.Fatal(err)
++	}
++	mon.Start()
++	defer mon.Close()
++
++	fake := NewFakeOS(t)
++	r, err := newUserspaceRouterAdvanced(logger.Discard, "tailscale0", mon, fake, health.NewTracker(bus), bus)
++	if err != nil {
++		t.Fatalf("newUserspaceRouterAdvanced: %v", err)
++	}
++	rules := []string{"-4 pref 5270 table 52"}
++	fake.rules = slices.Clone(rules)
++	if err := r.Close(); err != nil {
++		t.Errorf("Close = %v; want nil", err)
++	}
++	if !slices.Equal(fake.rules, rules) {
++		t.Errorf("rules after Close = %q; want %q", fake.rules, rules)
++	}
++}
++
++// TestCloseUsesInstalledRuleFamilies changes tunnel IPv6 availability after
++// Up. A rule added by this router must be removed, and one which predates an
++// IPv4-only startup must survive.
++func TestCloseUsesInstalledRuleFamilies(t *testing.T) {
++	const (
++		v4Rule = "-4 pref 5270 table 52"
++		v6Rule = "-6 pref 5270 table 52"
++	)
++	for _, tc := range []struct {
++		name           string
++		atUp, atRepair bool
++		foreign        string
++	}{
++		{"lost", true, false, ""},
++		{"dual-stack-repair", true, true, ""},
++		{"gain", false, true, ""},
++		{"gain-existing", false, true, v6Rule},
++		{"gain-source-specific", false, true, "-6 pref 5270 from 2001:db8::1 table 52"},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			r, host := newTestLinuxRouterBeforeUp(t, logger.Discard)
++			v6 := tc.atUp
++			r.interfaceV6Usable = func() bool { return v6 }
++			if tc.foreign != "" {
++				host.rules = append(host.rules, tc.foreign)
++			}
++			before := slices.Clone(host.rules)
++			if err := r.Up(); err != nil {
++				t.Fatal(err)
++			}
++			// The host removed the router's rules but kept its own.
++			host.rules = slices.Clone(before)
++			v6 = tc.atRepair
++			r.ruleRestorePending.Store(true)
++			r.restoreIPRules()
++			if !slices.Contains(host.rules, v4Rule) {
++				t.Fatal("IPv4 policy rule missing after repair")
++			}
++			wantV6 := tc.atUp && tc.atRepair || tc.foreign == v6Rule
++			if got := slices.Contains(host.rules, v6Rule); got != wantV6 {
++				t.Fatalf("IPv6 policy rule after repair = %v, want %v", got, wantV6)
++			}
++			v6 = false
++			if err := r.Close(); err != nil {
++				t.Fatal(err)
++			}
++			if !slices.Equal(host.rules, before) {
++				t.Errorf("rules after Close = %q, want %q", host.rules, before)
++			}
++		})
++	}
++}
++
++// TestRuleRepairOverlapsClose verifies that a rule repair already running
++// when Close starts cannot reinstall the rules Close removed.
++func TestRuleRepairOverlapsClose(t *testing.T) {
++	entered, resume, done := make(chan struct{}), make(chan struct{}), make(chan struct{})
++	logf := func(format string, args ...any) {
++		if strings.Contains(format, "restoring Tailscale's") {
++			close(entered)
++			<-resume
++		}
++	}
++	r, host := newTestLinuxRouterBeforeUp(t, logf)
++	if err := r.Up(); err != nil {
++		t.Fatal(err)
++	}
++	r.ruleRestorePending.Store(true)
++	go func() {
++		defer close(done)
++		r.restoreIPRules()
++	}()
++	<-entered
++	err := r.Close()
++	close(resume)
++	<-done
++	if err != nil {
++		t.Fatal(err)
++	}
++	if slices.Contains(host.rules, "-4 pref 5270 table 52") {
++		t.Error("rule repair reinstated the IPv4 lookup after Close")
++	}
++}
++
++// TestCloseAfterNetfilterLost verifies that Close still removes the policy
++// rules of a running router after a failed Set left it without a netfilter
++// runner.
++func TestCloseAfterNetfilterLost(t *testing.T) {
++	lr, fake := newTestLinuxRouter(t)
++	const v4Rule = "-4 pref 5270 table 52"
++	const v6Rule = "-6 pref 5270 table 52"
++	if !slices.Contains(fake.rules, v4Rule) || !slices.Contains(fake.rules, v6Rule) {
++		t.Fatalf("missing rule after Up: %q", fake.rules)
++	}
++	lr.nfr = nil
++	lr.Close()
++	if slices.Contains(fake.rules, v4Rule) || slices.Contains(fake.rules, v6Rule) {
++		t.Errorf("rules after Close = %q; want no table 52 rule", fake.rules)
++	}
++}
++
++// TestCloseDuringPortUpdate verifies that Close does not hold the router's
++// mutex while it waits for a port update handler that needs the same mutex.
++func TestCloseDuringPortUpdate(t *testing.T) {
++	var gaveUp atomic.Bool
++	bus := eventbus.NewWithOptions(eventbus.BusOptions{Logf: func(format string, args ...any) {
++		if strings.Contains(format, "giving up on subscriber") {
++			gaveUp.Store(true)
++		}
++	}})
++	defer bus.Close()
++	mon, err := netmon.New(bus, logger.Discard)
++	if err != nil {
++		t.Fatal(err)
++	}
++	mon.Start()
++	defer mon.Close()
++
++	// The handler logs before it takes the mutex. Hold it there until Close
++	// has begun.
++	var lr *linuxRouter
++	started := make(chan struct{})
++	logf := func(format string, args ...any) {
++		if strings.HasPrefix(format, "portUpdate(") {
++			close(started)
++			for !lr.closed.Load() {
++				runtime.Gosched()
++			}
++		}
++	}
++	fake := NewFakeOS(t)
++	r, err := newUserspaceRouterAdvanced(logf, "tailscale0", mon, fake, health.NewTracker(bus), bus)
++	if err != nil {
++		t.Fatalf("newUserspaceRouterAdvanced: %v", err)
++	}
++	lr = r.(*linuxRouter)
++	lr.nfr = fake.nfr
++
++	pub := bus.Client("test")
++	defer pub.Close()
++	eventbus.Publish[router.PortUpdate](pub).Publish(router.PortUpdate{UDPPort: 41641, EndpointNetwork: "udp4"})
++	<-started
++	lr.Close()
++	if gaveUp.Load() {
++		t.Error("Close waited for a handler blocked on the router's mutex")
++	}
++}
++
++func TestConcurrentCloseWaitsForRouterEvents(t *testing.T) {
++	synctest.Test(t, func(t *testing.T) {
++		bus := eventbus.New()
++		defer bus.Close()
++		r := &linuxRouter{eventClient: bus.Client("router")}
++		entered, resume := make(chan struct{}), make(chan struct{})
++		eventbus.SubscribeFunc(r.eventClient, func(router.PortUpdate) {
++			close(entered)
++			<-resume
++		})
++		pub := bus.Client("test")
++		defer pub.Close()
++		eventbus.Publish[router.PortUpdate](pub).Publish(router.PortUpdate{})
++		<-entered
++
++		done := make(chan error, 2)
++		for range 2 {
++			go func() { done <- r.Close() }()
++		}
++		synctest.Wait()
++		if len(done) != 0 {
++			t.Error("Close returned while the router event handler was running")
++		}
++		close(resume)
++		for range 2 {
++			if err := <-done; err != nil {
++				t.Fatal(err)
++			}
++		}
++	})
++}
++
++// TestCloseContinuesAfterError verifies that Close removes the policy rules
++// even when the interface cannot be brought down.
++func TestCloseContinuesAfterError(t *testing.T) {
++	lr, fake := newTestLinuxRouter(t)
++	if len(fake.rules) == 0 {
++		t.Fatal("Up installed no policy rules")
++	}
++	fake.downErr = errExec
++	if err := lr.Close(); !errors.Is(err, errExec) {
++		t.Errorf("Close = %v; want %v", err, errExec)
++	}
++	if len(fake.rules) != 0 {
++		t.Errorf("rules after Close = %q, want none", fake.rules)
++	}
++}
++
++func TestClosePreservesReplacementRules(t *testing.T) {
++	for _, tc := range []struct {
++		name    string
++		downErr error
++	}{
++		{"success", nil},
++		{"down-error", errExec},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			r, host := newTestLinuxRouter(t)
++			host.downErr = tc.downErr
++			if err := r.Close(); !errors.Is(err, tc.downErr) {
++				t.Fatalf("first Close = %v, want %v", err, tc.downErr)
++			}
++
++			// A replacement brought the same interface up and claimed table 52.
++			host.up = true
++			host.downErr = nil
++			want := []string{"-4 pref 5270 table 52", "-6 pref 5270 table 52"}
++			host.rules = slices.Clone(want)
++			r.interfaceV6Usable = func() bool { return false }
++			if err := r.Close(); err != nil {
++				t.Fatal(err)
++			}
++			if !host.up || !slices.Equal(host.rules, want) {
++				t.Errorf("second Close left up=%v, rules=%q, want up with %q", host.up, host.rules, want)
++			}
++		})
++	}
++}
++
+ // TestSetRemovesOrphanedTailscaleAddrs verifies that Set removes Tailscale-range
+ // addresses left on the interface by a previous instance (issue 19974), even
+ // though they're absent from the in-memory r.addrs map.
+diff --git a/wgengine/router/osrouter/router_windows.go b/wgengine/router/osrouter/router_windows.go
+index 3b32d5e014d26298b81542a30933829993355059..01bd9223bd71f7aa65b6d37e83cb3b34acaa885a 100644
+--- a/wgengine/router/osrouter/router_windows.go
++++ b/wgengine/router/osrouter/router_windows.go
+@@ -109,7 +109,7 @@ func hasDefaultRoute(routes []netip.Prefix) bool {
+ }
+ 
+ func (r *winRouter) Close() error {
+-	r.firewall.clear()
++	r.firewall.clearIfUsed()
+ 
+ 	if r.routeChangeCallback != nil {
+ 		r.routeChangeCallback.Unregister()
+@@ -161,6 +161,16 @@ type firewallTweaker struct {
+ 
+ func (ft *firewallTweaker) clear() { ft.set(nil, nil, nil) }
+ 
++// clearIfUsed only schedules a reset if this router has requested firewall
++// work. Starting a fresh worker would replace the host's inbound rules.
++func (ft *firewallTweaker) clearIfUsed() {
++	ft.mu.Lock()
++	defer ft.mu.Unlock()
++	if ft.running || ft.known {
++		ft.setLocked(nil, nil, nil)
++	}
++}
++
+ // set takes CIDRs to allow, and the routes that point into the Tailscale tun interface.
+ // Empty slices remove firewall rules.
+ //
+@@ -168,7 +178,10 @@ func (ft *firewallTweaker) clear() { ft.set(nil, nil, nil) }
+ func (ft *firewallTweaker) set(cidrs []string, routes, localRoutes []netip.Prefix) {
+ 	ft.mu.Lock()
+ 	defer ft.mu.Unlock()
++	ft.setLocked(cidrs, routes, localRoutes)
++}
+ 
++func (ft *firewallTweaker) setLocked(cidrs []string, routes, localRoutes []netip.Prefix) {
+ 	if len(cidrs) == 0 {
+ 		ft.logf("marking for removal")
+ 	} else {
+diff --git a/wgengine/router/osrouter/router_windows_test.go b/wgengine/router/osrouter/router_windows_test.go
+index abbbdf93b1fcbcfea7fd6de48d182032c4f5bf82..cb325c11492eee122b6eff3fe3368ec9460e472c 100644
+--- a/wgengine/router/osrouter/router_windows_test.go
++++ b/wgengine/router/osrouter/router_windows_test.go
+@@ -17,3 +17,13 @@ func TestGetNetshPath(t *testing.T) {
+ 		t.Errorf("expected absolute path for netsh.exe: %q", path)
+ 	}
+ }
++
++func TestCloseBeforeUpLeavesFirewallUnused(t *testing.T) {
++	r := &winRouter{firewall: &firewallTweaker{logf: func(format string, args ...any) {
++		// Fail on the synchronous request, before a worker can run netsh.
++		t.Fatalf(format, args...)
++	}}}
++	if err := r.Close(); err != nil {
++		t.Fatal(err)
++	}
++}
+diff --git a/wgengine/userspace.go b/wgengine/userspace.go
+index cc45fd404b4f3f82b6c3b17f5a07572c3880e436..2dde29e09d9e8fa6c3f5048ca32896fab97937a4 100644
+--- a/wgengine/userspace.go
++++ b/wgengine/userspace.go
+@@ -9,7 +9,6 @@ import (
+ 	"crypto/x509"
+ 	"errors"
+ 	"fmt"
+-	"io"
+ 	"math"
+ 	"net/netip"
+ 	"runtime"
+@@ -306,7 +305,8 @@ func NewFakeUserspaceEngine(logf logger.Logf, opts ...any) (Engine, error) {
+ }
+ 
+ // NewUserspaceEngine creates the named tun device and returns a
+-// Tailscale Engine running on it.
++// Tailscale Engine running on it. On failure it returns the startup error
++// joined with any errors from cleanup.
+ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error) {
+ 	var closePool closeOnErrorPool
+ 	defer closePool.closeAllIfError(&reterr)
+@@ -327,6 +327,9 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error)
+ 		logf("[v1] using fake (no-op) OS network configurator")
+ 		conf.Router = router.NewFake(logf)
+ 	}
++	// The engine owns the router from here on. The pool closes in order, so
++	// the router is taken down before the device, as Close does.
++	closePool.add(conf.Router.Close)
+ 	if conf.DNS == nil {
+ 		logf("[v1] using fake (no-op) DNS configurator")
+ 		d, err := dns.NewNoopManager()
+@@ -348,7 +351,7 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error)
+ 	} else {
+ 		tsTUNDev = tstun.Wrap(logf, conf.Tun, conf.Metrics, conf.EventBus)
+ 	}
+-	closePool.add(tsTUNDev)
++	closePool.add(tsTUNDev.Close)
+ 
+ 	rtr := conf.Router
+ 	if version.IsMobile() {
+@@ -391,6 +394,7 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error)
+ 		if err != nil {
+ 			return nil, err
+ 		}
++		closePool.addNoError(bird.Close)
+ 		e.bird = bird
+ 	}
+ 	e.isLocalAddr.Store(ipset.FalseContainsIPFunc())
+@@ -403,7 +407,7 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error)
+ 		if err != nil {
+ 			return nil, err
+ 		}
+-		closePool.add(mon)
++		closePool.add(mon.Close)
+ 		e.netMon = mon
+ 		e.netMonOwned = true
+ 	}
+@@ -413,6 +417,7 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error)
+ 	conf.Dialer.SetNetMon(e.netMon)
+ 	conf.Dialer.SetBus(e.eventBus)
+ 	e.dns = dns.NewManager(logf, conf.DNS, e.health, conf.Dialer, fwdDNSLinkSelector{e, tunName}, conf.ControlKnobs, runtime.GOOS, e.eventBus)
++	closePool.add(e.dns.Down)
+ 
+ 	// TODO: there's probably a better place for this
+ 	sockstats.SetNetMon(e.netMon)
+@@ -448,7 +453,7 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("wgengine: %v", err)
+ 	}
+-	closePool.add(e.magicConn)
++	closePool.add(e.magicConn.Close)
+ 	e.magicConn.SetNetworkUp(e.netMon.InterfaceState().AnyInterfaceUp())
+ 
+ 	if newNetLogger, ok := HookNewNetLogger.GetOk(); ok {
+@@ -517,12 +522,7 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error)
+ 	// wgdev takes ownership of tundev, will close it when closed.
+ 	e.logf("Creating WireGuard device...")
+ 	e.wgdev = wgcfg.NewDevice(e.tundev, e.magicConn.Bind(), e.wgLogger.DeviceLogger)
+-	closePool.addFunc(e.wgdev.Close)
+-	closePool.addFunc(func() {
+-		if err := e.magicConn.Close(); err != nil {
+-			e.logf("error closing magicconn: %v", err)
+-		}
+-	})
++	closePool.addNoError(e.wgdev.Close)
+ 
+ 	go func() {
+ 		up := false
+@@ -540,21 +540,6 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error)
+ 		}
+ 	}()
+ 
+-	go func() {
+-		select {
+-		case <-e.wgdev.Wait():
+-			e.mu.Lock()
+-			closing := e.closing
+-			e.mu.Unlock()
+-			if !closing {
+-				e.logf("Closing the engine because the WireGuard device has been closed...")
+-				e.Close()
+-			}
+-		case <-e.waitCh:
+-			// continue
+-		}
+-	}()
+-
+ 	e.logf("Bringing WireGuard device up...")
+ 	if err := e.wgdev.Up(); err != nil {
+ 		return nil, fmt.Errorf("wgdev.Up: %w", err)
+@@ -623,6 +608,22 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error)
+ 		e.magicConn.HandleDiscoKeyAdvertisement(peer.Node, pkt)
+ 	})
+ 	e.eventClient = ec
++	// Close needs a fully built engine, so the watcher starts only once
++	// nothing can fail and the pool will not close the device.
++	go func() {
++		select {
++		case <-e.wgdev.Wait():
++			e.mu.Lock()
++			closing := e.closing
++			e.mu.Unlock()
++			if !closing {
++				e.logf("Closing the engine because the WireGuard device has been closed...")
++				e.Close()
++			}
++		case <-e.waitCh:
++			// continue
++		}
++	}()
+ 	e.logf("Engine created.")
+ 	return e, nil
+ }
+@@ -1467,16 +1468,32 @@ func (e *userspaceEngine) peerForIP(ip netip.Addr) (ret PeerForIP, ok bool) {
+ 	return ret, false
+ }
+ 
+-type closeOnErrorPool []func()
++type closeOnErrorPool []func() error
++
++func (p *closeOnErrorPool) add(fn func() error) { *p = append(*p, fn) }
+ 
+-func (p *closeOnErrorPool) add(c io.Closer)   { *p = append(*p, func() { c.Close() }) }
+-func (p *closeOnErrorPool) addFunc(fn func()) { *p = append(*p, fn) }
+-func (p closeOnErrorPool) closeAllIfError(errp *error) {
+-	if *errp != nil {
+-		for _, closeFn := range p {
+-			closeFn()
++func (p *closeOnErrorPool) addNoError(fn func()) {
++	p.add(func() error {
++		fn()
++		return nil
++	})
++}
++
++// closeAllIfError takes a pointer so that a call deferred while the pool is
++// empty still closes what is added later.
++func (p *closeOnErrorPool) closeAllIfError(errp *error) {
++	if *errp == nil {
++		return
++	}
++	errs := []error{*errp}
++	for _, closeFn := range *p {
++		if err := closeFn(); err != nil {
++			errs = append(errs, err)
+ 		}
+ 	}
++	if len(errs) > 1 {
++		*errp = errors.Join(errs...)
++	}
+ }
+ 
+ // ipInPrefixes reports whether ip is in any of pp.
+diff --git a/wgengine/userspace_test.go b/wgengine/userspace_test.go
+index 0aff1b401c5c41049e63405966ae3b66e2c36369..41b92f8385fe7ae1f9294a8d00c2561efd10cc64 100644
+--- a/wgengine/userspace_test.go
++++ b/wgengine/userspace_test.go
+@@ -15,16 +15,20 @@ import (
+ 	"runtime"
+ 	"slices"
+ 	"sync"
++	"sync/atomic"
+ 	"testing"
+ 	"time"
+ 
+ 	"github.com/tailscale/wireguard-go/device"
++	"github.com/tailscale/wireguard-go/tun"
++	"github.com/tailscale/wireguard-go/tun/tuntest"
+ 	"go4.org/mem"
+ 	"tailscale.com/cmd/testwrapper/flakytest"
+ 	"tailscale.com/control/controlknobs"
+ 	"tailscale.com/derp"
+ 	"tailscale.com/derp/derpserver"
+ 	"tailscale.com/envknob"
++	"tailscale.com/feature/buildfeatures"
+ 	"tailscale.com/health"
+ 	"tailscale.com/net/dns"
+ 	"tailscale.com/net/dns/resolver"
+@@ -133,6 +137,138 @@ func (failingRouter) Up() error                  { return nil }
+ func (r failingRouter) Set(*router.Config) error { return r.err }
+ func (failingRouter) Close() error               { return nil }
+ 
++// closeCountingRouter is a failingRouter that counts its Close calls.
++type closeCountingRouter struct {
++	failingRouter
++	closeErr error
++	closed   atomic.Int32
++}
++
++func (r *closeCountingRouter) Close() error {
++	r.closed.Add(1)
++	return r.closeErr
++}
++
++// closeCountingTUN counts the Close calls of the device it wraps.
++type closeCountingTUN struct {
++	tun.Device
++	closeErr error
++	closed   atomic.Int32
++}
++
++func (d *closeCountingTUN) Close() error {
++	d.closed.Add(1)
++	return errors.Join(d.Device.Close(), d.closeErr)
++}
++
++// TestNewUserspaceEngineErrorCleanup checks that a constructor that fails
++// after binding its sockets releases its UDP port, closes its resources
++// once each and reports their errors in cleanup order.
++func TestNewUserspaceEngineErrorCleanup(t *testing.T) {
++	envknob.SetenvForTest(t, "TS_DEBUG_ALWAYS_USE_DERP", "false")
++	bus := eventbustest.NewBus(t)
++	watcher := eventbustest.NewWatcher(t, bus)
++
++	bird := new(closeCountingBird)
++	defer HookNewBird.SetForTest(func(logger.Logf, string) (Bird, error) { return bird, nil })()
++	osCfg := new(closeCountingOSConfigurator)
++	setErr := errors.New("router Set failed")
++	closeErr := errors.New("router Close failed")
++	tunErr := errors.New("TUN Close failed")
++	dev := &closeCountingTUN{Device: tuntest.NewChannelTUN().TUN(), closeErr: tunErr}
++	rtr := &closeCountingRouter{failingRouter: failingRouter{setErr}, closeErr: closeErr}
++	_, err := NewUserspaceEngine(t.Logf, Config{
++		Tun:           dev,
++		Router:        rtr,
++		DNS:           osCfg,
++		BIRDSocket:    "bird.ctl",
++		HealthTracker: health.NewTracker(bus),
++		Metrics:       new(usermetric.Registry),
++		EventBus:      bus,
++	})
++	want := []error{setErr, closeErr, tunErr}
++	joined, ok := err.(interface{ Unwrap() []error })
++	if !ok || len(joined.Unwrap()) != len(want) {
++		t.Fatalf("NewUserspaceEngine error = %v, want causes %v", err, want)
++	}
++	for i, cause := range want {
++		if !errors.Is(err, cause) || !errors.Is(joined.Unwrap()[i], cause) {
++			t.Errorf("NewUserspaceEngine error = %v, want cause %d to match %v", err, i, cause)
++		}
++	}
++	if n := dev.closed.Load(); n != 1 {
++		t.Errorf("device closed %d times, want 1", n)
++	}
++	if n := rtr.closed.Load(); n != 1 {
++		t.Errorf("router closed %d times, want 1", n)
++	}
++	if n, want := osCfg.closed.Load(), closes(buildfeatures.HasDNS); n != want {
++		t.Errorf("DNS configurator closed %d times, want %d", n, want)
++	}
++	if n, want := bird.closed.Load(), closes(buildfeatures.HasBird); n != want {
++		t.Errorf("BIRD client closed %d times, want %d", n, want)
++	}
++	if !buildfeatures.HasUDPTransport || runtime.GOOS == "js" {
++		return
++	}
++	var port uint16
++	if err := eventbustest.Expect(watcher, func(p router.PortUpdate) bool {
++		if p.EndpointNetwork != "udp4" {
++			return false
++		}
++		port = p.UDPPort
++		return true
++	}); err != nil {
++		t.Fatal(err)
++	}
++	if port == 0 {
++		t.Fatal("magicsock reported UDP4 port zero")
++	}
++	c, err := net.ListenUDP("udp4", &net.UDPAddr{Port: int(port)})
++	if err != nil {
++		t.Fatalf("UDP port %d still bound: %v", port, err)
++	}
++	c.Close()
++}
++
++func TestCloseOnErrorPoolPreservesStartupError(t *testing.T) {
++	startup := errors.New("startup failed")
++	err := startup
++	var pool closeOnErrorPool
++	pool.add(func() error { return nil })
++	pool.closeAllIfError(&err)
++	if err != startup {
++		t.Errorf("successful cleanup replaced the startup error with %v", err)
++	}
++}
++
++// closes returns the number of closes expected of a backend that is
++// compiled in when has is true.
++func closes(has bool) int32 {
++	if has {
++		return 1
++	}
++	return 0
++}
++
++// closeCountingOSConfigurator is a dns.OSConfigurator that counts its Close
++// calls.
++type closeCountingOSConfigurator struct {
++	recordingOSConfigurator
++	closed atomic.Int32
++}
++
++func (c *closeCountingOSConfigurator) Close() error { c.closed.Add(1); return nil }
++
++// closeCountingBird is a Bird that counts its Close calls.
++type closeCountingBird struct {
++	closed atomic.Int32
++}
++
++func (*closeCountingBird) Reconfig(tailcfg.NodeView) bool { return false }
++func (*closeCountingBird) ReconfigDone()                  {}
++func (b *closeCountingBird) Close()                       { b.closed.Add(1) }
++
+ // recordingOSConfigurator is a dns.OSConfigurator that records whether SetDNS
+ // was called.
+ type recordingOSConfigurator struct {

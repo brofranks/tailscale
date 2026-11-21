@@ -8,3 +8,4 @@ netmon-underlay-endpoints.patch
 netmon-linux-address-events.patch
 netns-registered-interface.patch
 osrouter-windows-local-routes.patch
+wgengine-constructor-cleanup.patch
