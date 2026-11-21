@@ -1,0 +1,82 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Brody Franks <brody@franks.id.au>
+Date: Fri, 20 Nov 2026 13:18:17 -0800
+Subject: [PATCH] wgengine/router/osrouter: report Linux tunnel IPv6
+ availability
+
+Expose IPv6Available for embedders adding addresses or routes after
+Up succeeds. Report whether the router selected IPv6 at startup and
+still considers it usable on the current backend and tunnel. A router
+started without IPv6 needs a restart to acquire it.
+
+Change-Id: I5b0e6f3a8d2c4e71a9f0b6c3d8e2a4f1b7c9d0e3
+Signed-off-by: Brody Franks <brody@franks.id.au>
+---
+ wgengine/router/osrouter/router_linux.go      |  9 ++++++++
+ wgengine/router/osrouter/router_linux_test.go | 33 +++++++++++++++++++++++++++
+ 2 files changed, 42 insertions(+)
+
+diff --git a/wgengine/router/osrouter/router_linux.go b/wgengine/router/osrouter/router_linux.go
+index bc2562a281ed61140341e9b09d2006214915d4a9..bfc823b6bcec6bbd26543871dd646b82320fd5f7 100644
+--- a/wgengine/router/osrouter/router_linux.go
++++ b/wgengine/router/osrouter/router_linux.go
+@@ -386,6 +386,15 @@ func (r *linuxRouter) restoreIPRules() {
+ 	r.justAddIPRules(families)
+ }
+ 
++// IPv6Available reports whether Up selected IPv6 and the router still
++// considers its backend and tunnel usable for IPv6 addresses and routes.
++// Call it after Up succeeds and before Close.
++func (r *linuxRouter) IPv6Available() bool {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	return slices.Contains(r.ruleFamilies, v6) && r.getV6Available()
++}
++
+ func (r *linuxRouter) Up() error {
+ 	r.mu.Lock()
+ 	defer r.mu.Unlock()
+diff --git a/wgengine/router/osrouter/router_linux_test.go b/wgengine/router/osrouter/router_linux_test.go
+index af22d32f7827c08dbfba682b319d4ed2244dae17..bd212a990305f1e99a58f6ed5837633dbb2e6bba 100644
+--- a/wgengine/router/osrouter/router_linux_test.go
++++ b/wgengine/router/osrouter/router_linux_test.go
+@@ -1783,6 +1783,39 @@ func TestCloseUsesInstalledRuleFamilies(t *testing.T) {
+ 	}
+ }
+ 
++func TestIPv6Available(t *testing.T) {
++	for _, atUp := range []bool{false, true} {
++		t.Run(fmt.Sprintf("available-at-up=%t", atUp), func(t *testing.T) {
++			r, _ := newTestLinuxRouterBeforeUp(t, logger.Discard)
++			usable := atUp
++			r.interfaceV6Usable = func() bool { return usable }
++			if r.IPv6Available() {
++				t.Fatal("IPv6 available before Up")
++			}
++			if err := r.Up(); err != nil {
++				t.Fatal(err)
++			}
++			for _, now := range []bool{true, false, true} {
++				usable = now
++				if got := r.IPv6Available(); got != (atUp && usable) {
++					t.Fatalf("tunnel usable = %t, IPv6Available = %t", usable, got)
++				}
++			}
++		})
++	}
++
++	t.Run("backend-loss-and-recovery", func(t *testing.T) {
++		r, fake := newTestLinuxRouter(t)
++		backend := fake.nfr.(*fakeIPTablesRunner)
++		for _, available := range []bool{true, false, true} {
++			backend.noV6 = !available
++			if got := r.IPv6Available(); got != available {
++				t.Fatalf("backend HasIPV6 = %t, IPv6Available = %t", available, got)
++			}
++		}
++	})
++}
++
+ // TestRuleRepairOverlapsClose verifies that a rule repair already running
+ // when Close starts cannot reinstall the rules Close removed.
+ func TestRuleRepairOverlapsClose(t *testing.T) {
