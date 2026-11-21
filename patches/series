@@ -6,3 +6,4 @@ magicsock-local-endpoint-ports.patch
 netmon-tunnel-registration.patch
 netmon-underlay-endpoints.patch
 netmon-linux-address-events.patch
+netns-registered-interface.patch
