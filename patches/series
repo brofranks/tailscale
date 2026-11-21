@@ -9,3 +9,4 @@ netmon-linux-address-events.patch
 netns-registered-interface.patch
 osrouter-windows-local-routes.patch
 wgengine-constructor-cleanup.patch
+magicsock-newconn-cleanup.patch
