@@ -1,0 +1,117 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Brody Franks <brody@franks.id.au>
+Date: Thu, 19 Nov 2026 17:18:45 -0800
+Subject: [PATCH] net/tstun: stop answering echo requests for Tailscale service
+ addresses
+
+The wrapper answered ICMP echo requests for 100.100.100.100 and
+fd7a:115c:a1e0::53 itself, so a request routed to a WireGuard peer never
+left the host. Pass these requests through the filter like any other
+packet.
+
+Change-Id: I3957becf81cdbebc72cfb2a4babeeec5f2d2b186
+Signed-off-by: Brody Franks <brody@franks.id.au>
+---
+ net/tstun/wrap.go      | 23 -----------------------
+ net/tstun/wrap_test.go | 49 +++++++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 49 insertions(+), 23 deletions(-)
+
+diff --git a/net/tstun/wrap.go b/net/tstun/wrap.go
+index a29b02c07140a9df5521a1eeda6fe36ea35ba0a0..ecd794414c872089d82218c508e0ff31ee6a899c 100644
+--- a/net/tstun/wrap.go
++++ b/net/tstun/wrap.go
+@@ -744,30 +744,7 @@ func (t *Wrapper) SetPeerRoutes(native4, native6 netip.Addr, routes *bart.Table[
+ 	}
+ }
+ 
+-var (
+-	magicDNSIPPort   = netip.AddrPortFrom(tsaddr.TailscaleServiceIP(), 0) // 100.100.100.100:0
+-	magicDNSIPPortv6 = netip.AddrPortFrom(tsaddr.TailscaleServiceIPv6(), 0)
+-)
+-
+ func (t *Wrapper) filterPacketOutboundToWireGuard(p *packet.Parsed, pc *peerConfigTable, gro *gro.GRO) (filter.Response, *gro.GRO) {
+-	// Fake ICMP echo responses to MagicDNS (100.100.100.100).
+-	if p.IsEchoRequest() {
+-		switch p.Dst {
+-		case magicDNSIPPort:
+-			header := p.ICMP4Header()
+-			header.ToResponse()
+-			outp := packet.Generate(&header, p.Payload())
+-			t.InjectInboundCopy(outp)
+-			return filter.DropSilently, gro // don't pass on to OS; already handled
+-		case magicDNSIPPortv6:
+-			header := p.ICMP6Header()
+-			header.ToResponse()
+-			outp := packet.Generate(&header, p.Payload())
+-			t.InjectInboundCopy(outp)
+-			return filter.DropSilently, gro // don't pass on to OS; already handled
+-		}
+-	}
+-
+ 	// TSMP traffic should only originate from tailscaled, not from the host
+ 	// itself.
+ 	if p.IPProto == ipproto.TSMP {
+diff --git a/net/tstun/wrap_test.go b/net/tstun/wrap_test.go
+index 2b92b5a37562cad1f86fd8a479505059a2f63703..be15cbf436bcb12bf65c5638315c78c38c2bdcf9 100644
+--- a/net/tstun/wrap_test.go
++++ b/net/tstun/wrap_test.go
+@@ -34,6 +34,7 @@
+ 	"tailscale.com/net/packet"
+ 	"tailscale.com/net/packet/checksum"
+ 	"tailscale.com/net/routemanager"
++	"tailscale.com/net/tsaddr"
+ 	"tailscale.com/tstest"
+ 	"tailscale.com/tstime/mono"
+ 	"tailscale.com/types/ipproto"
+@@ -1375,3 +1376,51 @@ func TestStackGSOToTunGSO(t *testing.T) {
+ 		})
+ 	}
+ }
++
++type writeCountingTUN struct {
++	wgtun.Device
++	writes int
++}
++
++func (d *writeCountingTUN) Write(buffs [][]byte, offset int) (int, error) {
++	d.writes++
++	return d.Device.Write(buffs, offset)
++}
++
++func TestServiceAddressEchoPassesThrough(t *testing.T) {
++	dev := &writeCountingTUN{Device: NewFake()}
++	tun := Wrap(t.Logf, dev, new(usermetric.Registry), eventbustest.NewBus(t))
++	defer tun.Close()
++	tun.SetFilter(filter.NewAllowAllForTest(t.Logf))
++	for _, tc := range []struct {
++		src string
++		dst netip.Addr
++	}{
++		{"100.64.0.1", tsaddr.TailscaleServiceIP()},
++		{"fd7a:115c:a1e0::1", tsaddr.TailscaleServiceIPv6()},
++	} {
++		src := netip.MustParseAddr(tc.src)
++		var h packet.Header = &packet.ICMP4Header{
++			IP4Header: packet.IP4Header{IPProto: ipproto.ICMPv4, Src: src, Dst: tc.dst},
++			Type:      packet.ICMP4EchoRequest,
++		}
++		if tc.dst.Is6() {
++			h = &packet.ICMP6Header{
++				IP6Header: packet.IP6Header{IPProto: ipproto.ICMPv6, Src: src, Dst: tc.dst},
++				Type:      packet.ICMP6EchoRequest,
++			}
++		}
++		p := new(packet.Parsed)
++		p.Decode(packet.Generate(h, make([]byte, 4))) // identifier and sequence
++		if !p.IsEchoRequest() {
++			t.Fatalf("not an echo request: %v", p)
++		}
++		dev.writes = 0
++		if got, _ := tun.filterPacketOutboundToWireGuard(p, nil, nil); got != filter.Accept {
++			t.Errorf("%v: filter response = %v, want %v", tc.dst, got, filter.Accept)
++		}
++		if dev.writes != 0 {
++			t.Errorf("%v: local TUN writes = %d, want 0", tc.dst, dev.writes)
++		}
++	}
++}
