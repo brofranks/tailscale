@@ -1,0 +1,391 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Brody Franks <brody@franks.id.au>
+Date: Thu, 19 Nov 2026 17:23:28 -0800
+Subject: [PATCH] wgengine/router/osrouter: distinguish local and peer routes
+ on Windows
+
+Windows installs a host route for each assigned address. Skip only
+exact local hosts when building routes so a subnet whose base is an
+assigned address still reaches its peers.
+
+Use the installed route's protocol to distinguish local host and
+connected routes from static peer routes, including a host at the last
+address in a routed subnet. Windows reports an assigned next hop as
+unspecified. Use that form so the next sync recognizes the route.
+
+Change-Id: I94ad1e43096b8fb03e592f84313181091e5d1858
+Signed-off-by: Brody Franks <brody@franks.id.au>
+---
+ wgengine/router/osrouter/ifconfig_windows.go      | 87 ++++++--------------
+ wgengine/router/osrouter/ifconfig_windows_test.go | 98 +++++++++++++++--------
+ wgengine/router/osrouter/osrouter.go              | 37 ++++++++-
+ wgengine/router/osrouter/osrouter_test.go         | 33 +++++++-
+ 4 files changed, 159 insertions(+), 96 deletions(-)
+
+diff --git a/wgengine/router/osrouter/ifconfig_windows.go b/wgengine/router/osrouter/ifconfig_windows.go
+index d24fe97900aed16cecb5a3c4df78ba4479fd5cea..82f802b9d86004ab8adb889aa34e272ca6241cf5 100644
+--- a/wgengine/router/osrouter/ifconfig_windows.go
++++ b/wgengine/router/osrouter/ifconfig_windows.go
+@@ -23,7 +23,6 @@
+ 
+ 	ole "github.com/go-ole/go-ole"
+ 	"github.com/tailscale/wireguard-go/tun"
+-	"go4.org/netipx"
+ 	"golang.org/x/sys/windows"
+ 	"golang.zx2c4.com/wireguard/windows/tunnel/winipcfg"
+ )
+@@ -336,7 +335,6 @@ func configureInterface(cfg *router.Config, tun *tun.NativeTun, ht *health.Track
+ 	// routes from being marked as on-link. We can still create on-link routes
+ 	// for single-host Tailscale routes, but we shouldn't attempt to create a
+ 	// route for the interface's own IP.
+-	var localAddr4, localAddr6 netip.Addr
+ 	var gatewayAddr4, gatewayAddr6 netip.Addr
+ 	addresses := make([]netip.Prefix, 0, len(cfg.LocalAddrs))
+ 	for _, addr := range cfg.LocalAddrs {
+@@ -346,10 +344,8 @@ func configureInterface(cfg *router.Config, tun *tun.NativeTun, ht *health.Track
+ 		}
+ 		addresses = append(addresses, addr)
+ 		if addr.Addr().Is4() && !gatewayAddr4.IsValid() {
+-			localAddr4 = addr.Addr()
+ 			gatewayAddr4 = tsaddr.TailscaleServiceIP()
+ 		} else if addr.Addr().Is6() && !gatewayAddr6.IsValid() {
+-			localAddr6 = addr.Addr()
+ 			gatewayAddr6 = tsaddr.TailscaleServiceIPv6()
+ 		}
+ 	}
+@@ -378,31 +374,14 @@ func configureInterface(cfg *router.Config, tun *tun.NativeTun, ht *health.Track
+ 			return errors.New("due to a Windows limitation, one cannot have interface routes without an interface address")
+ 		}
+ 
+-		var gateway, localAddr netip.Addr
+-		if route.Addr().Is4() {
+-			localAddr = localAddr4
+-			gateway = gatewayAddr4
+-		} else if route.Addr().Is6() {
+-			localAddr = localAddr6
++		gateway := gatewayAddr4
++		if route.Addr().Is6() {
+ 			gateway = gatewayAddr6
+ 		}
+ 
+-		switch destAddr := route.Addr().Unmap(); {
+-		case destAddr == localAddr:
+-			// no need to add a route for the interface's
+-			// own IP. The kernel does that for us.
+-			// If we try to replace it, we'll fail to
+-			// add the route unless NextHop is set, but
+-			// then the interface's IP won't be pingable.
++		gateway = windowsRouteNextHop(route, gateway, addresses)
++		if !gateway.IsValid() {
+ 			continue
+-		case route.IsSingleIP() && (destAddr == gateway || tsaddr.IsTailscaleIP(destAddr)):
+-			// add an on-link route if the destination
+-			// is the nexthop itself or a single Tailscale IP.
+-			if route.Addr().Is4() {
+-				gateway = netip.IPv4Unspecified()
+-			} else {
+-				gateway = netip.IPv6Unspecified()
+-			}
+ 		}
+ 
+ 		r := &routeData{
+@@ -455,7 +434,7 @@ func configureInterface(cfg *router.Config, tun *tun.NativeTun, ht *health.Track
+ 	}
+ 
+ 	var errAcc error
+-	err = syncRoutes(iface, deduplicatedRoutes, cfg.LocalAddrs)
++	err = syncRoutes(iface, deduplicatedRoutes, addresses)
+ 	if err != nil && errAcc == nil {
+ 		log.Printf("setroutes: %v", err)
+ 		errAcc = err
+@@ -759,48 +738,34 @@ func getAllInterfaceRoutes(ifc *winipcfg.IPAdapterAddresses) ([]*routeData, erro
+ 	return rd, nil
+ }
+ 
+-// filterRoutes removes routes that have been added by Windows and should not
+-// be managed by us.
+-func filterRoutes(routes []*routeData, dontDelete []netip.Prefix) []*routeData {
+-	ddm := make(map[netip.Prefix]bool)
+-	for _, dd := range dontDelete {
+-		// See issue 1448: we don't want to touch the routes added
+-		// by Windows for our interface addresses.
+-		ddm[dd] = true
+-	}
+-	for _, r := range routes {
+-		// We don't want to touch broadcast routes that Windows adds.
+-		nr := r.Destination
+-		if !nr.IsValid() {
+-			continue
+-		}
+-		if nr.IsSingleIP() {
+-			continue
+-		}
+-		lastIP := netipx.RangeOfPrefix(nr).To()
+-		ddm[netip.PrefixFrom(lastIP, lastIP.BitLen())] = true
+-	}
+-	filtered := make([]*routeData, 0, len(routes))
+-	for _, r := range routes {
+-		rr := r.Destination
+-		if rr.IsValid() && ddm[rr] {
+-			continue
+-		}
+-		filtered = append(filtered, r)
+-	}
+-	return filtered
++// filterRoutes excludes local host routes and connected routes for assigned
++// subnets from the installed rows.
++func filterRoutes(routes []*routeData, assigned []netip.Prefix) []*routeData {
++	return slices.DeleteFunc(routes, func(r *routeData) bool {
++		if r.Row.Protocol != winipcfg.RouteProtocolLocal {
++			return false
++		}
++		// Windows adds host routes for interface addresses (issue 1448) and
++		// IPv4 broadcasts, and connected routes for assigned subnets.
++		return r.Destination.IsSingleIP() ||
++			slices.ContainsFunc(assigned, func(addr netip.Prefix) bool {
++				return r.Destination == addr.Masked()
++			})
++	})
+ }
+ 
+-// syncRoutes incrementally sets multiples routes on an interface.
++// syncRoutes incrementally sets routes on an interface.
+ // This avoids a full ifc.FlushRoutes call.
+-// dontDelete is a list of interface address routes that the
+-// synchronization logic should never delete.
+-func syncRoutes(ifc *winipcfg.IPAdapterAddresses, want []*routeData, dontDelete []netip.Prefix) error {
++func syncRoutes(
++	ifc *winipcfg.IPAdapterAddresses,
++	want []*routeData,
++	assigned []netip.Prefix,
++) error {
+ 	existingRoutes, err := getAllInterfaceRoutes(ifc)
+ 	if err != nil {
+ 		return err
+ 	}
+-	got := filterRoutes(existingRoutes, dontDelete)
++	got := filterRoutes(existingRoutes, assigned)
+ 
+ 	add, del := deltaRouteData(got, want)
+ 
+diff --git a/wgengine/router/osrouter/ifconfig_windows_test.go b/wgengine/router/osrouter/ifconfig_windows_test.go
+index f272a59f899f6e1121b47a76b4ab5fa455f878fe..d8f775f5e4e6d014960afc40e11c359a745d5780 100644
+--- a/wgengine/router/osrouter/ifconfig_windows_test.go
++++ b/wgengine/router/osrouter/ifconfig_windows_test.go
+@@ -8,10 +8,12 @@
+ 	"math/rand"
+ 	"net/netip"
+ 	"reflect"
++	"slices"
+ 	"strings"
+ 	"testing"
+ 
+ 	"golang.zx2c4.com/wireguard/windows/tunnel/winipcfg"
++	"tailscale.com/net/tsaddr"
+ )
+ 
+ func randIP() netip.Addr {
+@@ -168,40 +170,72 @@ func ipnet4(ip string, bits int) netip.Prefix {
+ }
+ 
+ func TestFilterRoutes(t *testing.T) {
+-	var h0 netip.Addr
+-
+-	in := []*routeData{
+-		// LinkLocal and Loopback routes.
+-		{RouteData: W{ipnet4("169.254.0.0", 16), h0, 1}},
+-		{RouteData: W{ipnet4("169.254.255.255", 32), h0, 1}},
+-		{RouteData: W{ipnet4("127.0.0.0", 8), h0, 1}},
+-		{RouteData: W{ipnet4("127.255.255.255", 32), h0, 1}},
+-		// Local LAN routes.
+-		{RouteData: W{ipnet4("192.168.0.0", 24), h0, 1}},
+-		{RouteData: W{ipnet4("192.168.0.255", 32), h0, 1}},
+-		{RouteData: W{ipnet4("192.168.1.0", 25), h0, 1}},
+-		{RouteData: W{ipnet4("192.168.1.127", 32), h0, 1}},
+-		// Some random other route.
+-		{RouteData: W{ipnet4("192.168.2.23", 32), h0, 1}},
+-		// Our own tailscale address.
+-		{RouteData: W{ipnet4("100.100.100.100", 32), h0, 1}},
+-		// Other tailscale addresses.
+-		{RouteData: W{ipnet4("100.100.100.101", 32), h0, 1}},
+-		{RouteData: W{ipnet4("100.100.100.102", 32), h0, 1}},
++	const (
++		local  = winipcfg.RouteProtocolLocal
++		static = winipcfg.RouteProtocolNetMgmt
++	)
++	route := func(prefix, hop string, proto winipcfg.RouteProtocol) *routeData {
++		return &routeData{
++			RouteData: W{
++				Destination: netip.MustParsePrefix(prefix),
++				NextHop:     netip.MustParseAddr(hop),
++			},
++			Row: &winipcfg.MibIPforwardRow2{Protocol: proto},
++		}
++	}
++	assigned := mustCIDRs("100.64.0.16/32", "192.0.2.17/24", "fd42::10/128", "fd42::21/64")
++	kernel := []*routeData{
++		// Link-local and loopback broadcast routes.
++		route("169.254.255.255/32", "0.0.0.0", local),
++		route("127.255.255.255/32", "0.0.0.0", local),
++		// Hosts, connected subnets and broadcast routes for local addresses.
++		route("100.64.0.16/32", "0.0.0.0", local),
++		route("192.0.2.17/32", "0.0.0.0", local),
++		route("192.0.2.0/24", "0.0.0.0", local),
++		route("192.0.2.255/32", "0.0.0.0", local),
++		route("fd42::10/128", "::", local),
++		route("fd42::21/128", "::", local),
++		route("fd42::/64", "::", local),
+ 	}
+ 	want := []*routeData{
+-		{RouteData: W{ipnet4("169.254.0.0", 16), h0, 1}},
+-		{RouteData: W{ipnet4("127.0.0.0", 8), h0, 1}},
+-		{RouteData: W{ipnet4("192.168.0.0", 24), h0, 1}},
+-		{RouteData: W{ipnet4("192.168.1.0", 25), h0, 1}},
+-		{RouteData: W{ipnet4("192.168.2.23", 32), h0, 1}},
+-		{RouteData: W{ipnet4("100.100.100.101", 32), h0, 1}},
+-		{RouteData: W{ipnet4("100.100.100.102", 32), h0, 1}},
+-	}
+-
+-	got := filterRoutes(in, mustCIDRs("100.100.100.100/32"))
+-	if !equalRouteDatas(got, want) {
+-		t.Errorf("\ngot:  %v\n  want: %v\n", formatRouteData(got), formatRouteData(want))
++		// A routed subnet and a peer at its last address in each family.
++		route("100.64.0.16/28", "100.100.100.100", static),
++		route("100.64.0.31/32", "0.0.0.0", static),
++		route("fd42::10/124", "fd7a:115c:a1e0::53", static),
++		route("fd42::1f/128", "fd7a:115c:a1e0::53", static),
++		// A static route can share a prefix with a connected route.
++		route("192.0.2.0/24", "100.100.100.100", static),
++	}
++
++	got := filterRoutes(slices.Concat(kernel, want), assigned)
++	add, del := deltaRouteData(got, want)
++	if len(add) != 0 || len(del) != 0 {
++		t.Errorf("repeat sync: add %v, delete %v", formatRouteData(add), formatRouteData(del))
++	}
++
++	// Unassigned subnets and withdrawn peer routes are still deletable.
++	stale := []*routeData{
++		route("169.254.0.0/16", "0.0.0.0", local),
++		route("127.0.0.0/8", "0.0.0.0", local),
++	}
++	got = filterRoutes(slices.Concat(kernel, want, stale), assigned)
++	_, del = deltaRouteData(got, nil)
++	wantDel := slices.Concat(want, stale)
++	slices.SortFunc(wantDel, (*routeData).Compare)
++	if !equalRouteDatas(del, wantDel) {
++		t.Errorf("withdraw routes: delete %v, want %v", formatRouteData(del), formatRouteData(wantDel))
++	}
++
++	// An IPv4-only configuration with IPv6 routes gains a local IPv6 address.
++	ip := tsaddr.Tailscale4To6Placeholder()
++	placeholder := netip.PrefixFrom(ip, ip.BitLen())
++	got = filterRoutes(
++		[]*routeData{route(placeholder.String(), "::", local)},
++		[]netip.Prefix{placeholder},
++	)
++	_, del = deltaRouteData(got, nil)
++	if len(del) != 0 {
++		t.Errorf("delete IPv6 placeholder: %v", formatRouteData(del))
+ 	}
+ }
+ 
+diff --git a/wgengine/router/osrouter/osrouter.go b/wgengine/router/osrouter/osrouter.go
+index ac4e48c7268c7d95769ae772a0baa9afece01a93..8df8b85177c47d8334d99fbc6fd4bf66b45b09ba 100644
+--- a/wgengine/router/osrouter/osrouter.go
++++ b/wgengine/router/osrouter/osrouter.go
+@@ -7,9 +7,44 @@
+ // package.
+ package osrouter
+ 
+-import "tailscale.com/wgengine/router"
++import (
++	"net/netip"
++	"slices"
++
++	"tailscale.com/net/tsaddr"
++	"tailscale.com/wgengine/router"
++)
+ 
+ // shutdownConfig is a routing configuration that removes all router
+ // state from the OS. It's the config used when callers pass in a nil
+ // Config.
+ var shutdownConfig router.Config
++
++// windowsRouteNextHop returns the next hop Windows reports for a route.
++// An invalid address skips a host route the kernel already supplies.
++func windowsRouteNextHop(
++	route netip.Prefix,
++	gateway netip.Addr,
++	assigned []netip.Prefix,
++) netip.Addr {
++	isAssigned := func(ip netip.Addr) bool {
++		return slices.ContainsFunc(assigned, func(p netip.Prefix) bool {
++			return p.Addr().Unmap() == ip
++		})
++	}
++	dest := route.Addr().Unmap()
++	if route.IsSingleIP() && isAssigned(dest) {
++		// Replacing the host route can make the adapter IP unreachable.
++		return netip.Addr{}
++	}
++	// Host routes to the gateway and single Tailscale IPs are on-link.
++	// Windows also reports an assigned next hop as the unspecified address.
++	if (route.IsSingleIP() && (dest == gateway || tsaddr.IsTailscaleIP(dest))) ||
++		isAssigned(gateway) {
++		if route.Addr().Is4() {
++			return netip.IPv4Unspecified()
++		}
++		return netip.IPv6Unspecified()
++	}
++	return gateway
++}
+diff --git a/wgengine/router/osrouter/osrouter_test.go b/wgengine/router/osrouter/osrouter_test.go
+index 5e81d6297d035b38bb58e4b1ceaf186ba1b20e70..12ecce9ba62b94378d2bb7e3f81ca111b7502d53 100644
+--- a/wgengine/router/osrouter/osrouter_test.go
++++ b/wgengine/router/osrouter/osrouter_test.go
+@@ -3,9 +3,11 @@
+ 
+ package osrouter
+ 
+-import "net/netip"
++import (
++	"net/netip"
++	"testing"
++)
+ 
+-//lint:ignore U1000 used in Windows/Linux tests only
+ func mustCIDRs(ss ...string) []netip.Prefix {
+ 	var ret []netip.Prefix
+ 	for _, s := range ss {
+@@ -13,3 +15,30 @@ func mustCIDRs(ss ...string) []netip.Prefix {
+ 	}
+ 	return ret
+ }
++
++func TestWindowsRouteNextHop(t *testing.T) {
++	const gw4, gw6 = "100.100.100.100", "fd7a:115c:a1e0::53"
++	assigned := mustCIDRs("fd42::10/128", "fd42::21/64", "10.0.0.16/32", "10.0.0.17/32")
++	for _, tc := range []struct{ route, gateway, want string }{
++		{"fd42::10/124", gw6, gw6},
++		{"fd42::10/128", gw6, ""},
++		{"fd42::21/128", gw6, ""},
++		{"fd42::22/128", gw6, gw6},
++		{"10.0.0.16/28", gw4, gw4},
++		{"10.0.0.17/32", gw4, ""},
++		{gw4 + "/32", gw4, "0.0.0.0"},
++		{"100.64.0.7/32", gw4, "0.0.0.0"},
++		{"::/0", gw6, gw6},
++		{"fd42::10/124", "fd42::21", "::"},
++		{"10.0.0.16/28", "10.0.0.17", "0.0.0.0"},
++	} {
++		var want netip.Addr
++		if tc.want != "" {
++			want = netip.MustParseAddr(tc.want)
++		}
++		got := windowsRouteNextHop(netip.MustParsePrefix(tc.route), netip.MustParseAddr(tc.gateway), assigned)
++		if got != want {
++			t.Errorf("route %s via %s: next hop = %v, want %v", tc.route, tc.gateway, got, want)
++		}
++	}
++}
