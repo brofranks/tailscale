@@ -1,0 +1,130 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Brody Franks <brody@franks.id.au>
+Date: Thu, 19 Nov 2026 17:23:04 -0800
+Subject: [PATCH] net/netmon: retain the tunnel name when index lookup fails
+
+SetTailscaleInterfaceProps dropped a name-only registration when
+net.Interfaces failed, as it can in an Android app, and left any
+previous name and index in place. Look the index up with
+net.InterfaceByName, record the name either way, and clear the index
+when the lookup fails. The lookup stays with the OS because a
+registered interface getter may report synthetic indices.
+
+Change-Id: I11dde37dc99f93f1d58d337571a6a0def21c376e
+Signed-off-by: Brody Franks <brody@franks.id.au>
+---
+ net/netmon/interfaces.go      | 28 ++++++++------------
+ net/netmon/interfaces_test.go | 50 +++++++++++++++++++++++++++++++++++
+ 2 files changed, 61 insertions(+), 17 deletions(-)
+
+diff --git a/net/netmon/interfaces.go b/net/netmon/interfaces.go
+index c7a2cb213e89386d66db124249a60b654e03adb5..b806259877102d837c147b34e9d79928d2398741 100644
+--- a/net/netmon/interfaces.go
++++ b/net/netmon/interfaces.go
+@@ -46,30 +46,24 @@ func (m *Monitor) SetTailscaleInterfaceName(ifName string) {
+ 	SetTailscaleInterfaceProps(ifName, 0)
+ }
+ 
+-// SetTailscaleInterfaceProps sets the name of the Tailscale interface and
+-// its index for use by various listeners/dialers.  If the index is zero,
+-// an attempt will be made to look it up by name.  This makes no attempt
+-// to validate that the interface exists at the time of calling.
++var kernelInterfaceByName = net.InterfaceByName
++
++// SetTailscaleInterfaceProps records the Tailscale interface name and kernel
++// index for listeners and dialers. It uses a nonzero index as supplied. When
++// given only a name, it asks the OS for the index. If the lookup fails, it
++// records the name and clears any previous index. An empty name and zero
++// index clear the registration.
+ //
+ // If this method is called, it is the responsibility of the caller to
+ // update the interface name and index if they change.
+ //
+ // This should be called as early as possible during tailscaled startup.
+ func SetTailscaleInterfaceProps(ifName string, ifIndex int) {
+-	if ifIndex != 0 {
+-		tsIfProps.set(ifName, ifIndex)
+-		return
+-	}
+-
+-	ifaces, err := net.Interfaces()
+-	if err != nil {
+-		return
+-	}
+-
+-	for _, iface := range ifaces {
+-		if iface.Name == ifName {
++	if ifName != "" && ifIndex == 0 {
++		// Only the OS can supply a kernel interface index. A provider may
++		// supply synthetic indices in its network inventory.
++		if iface, err := kernelInterfaceByName(ifName); err == nil {
+ 			ifIndex = iface.Index
+-			break
+ 		}
+ 	}
+ 
+diff --git a/net/netmon/interfaces_test.go b/net/netmon/interfaces_test.go
+index 34ddfe260d7188ae63f51f4e23953b5df2168f25..1bd59772fab0a17ae01fd50b88889fa3a37a5e4f 100644
+--- a/net/netmon/interfaces_test.go
++++ b/net/netmon/interfaces_test.go
+@@ -7,6 +7,7 @@
+ 	"encoding/json"
+ 	"net"
+ 	"net/netip"
++	"os"
+ 	"slices"
+ 	"testing"
+ 
+@@ -429,3 +430,52 @@ func TestEqual(t *testing.T) {
+ 		})
+ 	}
+ }
++
++func TestSetTailscaleInterfaceProps(t *testing.T) {
++	oldName, oldIndex := tsIfProps.tsIfName(), tsIfProps.tsIfIndex()
++	t.Cleanup(func() { tsIfProps.set(oldName, oldIndex) })
++
++	const knownName, deniedName = "known-tun", "denied-tun"
++	var lookups []string
++	tstest.Replace(t, &kernelInterfaceByName, func(name string) (*net.Interface, error) {
++		lookups = append(lookups, name)
++		if name == knownName {
++			return &net.Interface{Name: name, Index: 7}, nil
++		}
++		return nil, os.ErrPermission
++	})
++	tstest.Replace(t, &altNetInterfaces, func() ([]Interface, error) {
++		return []Interface{
++			{Interface: &net.Interface{Name: knownName, Index: 42}},
++			{Interface: &net.Interface{Name: deniedName, Index: 43}},
++		}, nil
++	})
++
++	SetTailscaleInterfaceProps(knownName, 0)
++	if index, err := TailscaleInterfaceIndex(); err != nil || index != 7 {
++		t.Fatalf("kernel index = %d, %v, want 7", index, err)
++	}
++
++	SetTailscaleInterfaceProps(deniedName, 0)
++	if got, err := TailscaleInterfaceName(); err != nil || got != deniedName {
++		t.Fatalf("name after failed lookup = %q, %v, want %q", got, err, deniedName)
++	}
++	if index, err := TailscaleInterfaceIndex(); err == nil || index != 0 {
++		t.Fatalf("index after failed lookup = %d, %v, want unknown", index, err)
++	}
++
++	SetTailscaleInterfaceProps(knownName, 9)
++	if index, err := TailscaleInterfaceIndex(); err != nil || index != 9 {
++		t.Fatalf("explicit index = %d, %v, want 9", index, err)
++	}
++	SetTailscaleInterfaceProps("", 0)
++	if _, err := TailscaleInterfaceName(); err == nil {
++		t.Error("name still registered after removal")
++	}
++	if index, err := TailscaleInterfaceIndex(); err == nil || index != 0 {
++		t.Errorf("index after removal = %d, %v, want unknown", index, err)
++	}
++	if want := []string{knownName, deniedName}; !slices.Equal(lookups, want) {
++		t.Errorf("kernel lookups = %q, want %q", lookups, want)
++	}
++}
