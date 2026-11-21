@@ -1,0 +1,102 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Brody Franks <brody@franks.id.au>
+Date: Thu, 19 Nov 2026 17:20:25 -0800
+Subject: [PATCH] net/netmon: offer CGNAT candidates after tunnel registration
+
+LocalAddresses skipped IPv4 addresses in Tailscale's CGNAT allocation
+even on a shared LAN, which could leave peers using a relay. With a
+registered tunnel name, offer those addresses on other eligible
+interfaces as direct endpoint candidates. Keep the IPv4 range check
+when no name is registered and keep excluding the Tailscale IPv6 ULA
+range.
+
+Change-Id: Ic23d33bce93a8978c28e2e589845f477cd030f28
+Signed-off-by: Brody Franks <brody@franks.id.au>
+---
+ net/netmon/interfaces_test.go | 45 +++++++++++++++++++++++++++++++++++++++++++
+ net/netmon/state.go           |  9 +++------
+ 2 files changed, 48 insertions(+), 6 deletions(-)
+
+diff --git a/net/netmon/interfaces_test.go b/net/netmon/interfaces_test.go
+index 1bd59772fab0a17ae01fd50b88889fa3a37a5e4f..881ceced3471b83bdcc5d4fee34e33af046327eb 100644
+--- a/net/netmon/interfaces_test.go
++++ b/net/netmon/interfaces_test.go
+@@ -11,6 +11,7 @@
+ 	"slices"
+ 	"testing"
+ 
++	"go4.org/netipx"
+ 	"tailscale.com/tstest"
+ )
+ 
+@@ -127,6 +128,50 @@ func TestLikelyHomeRouterIP(t *testing.T) {
+ 	})
+ }
+ 
++func TestLocalAddressesCGNAT(t *testing.T) {
++	oldName, oldIndex := tsIfProps.tsIfName(), tsIfProps.tsIfIndex()
++	t.Cleanup(func() { tsIfProps.set(oldName, oldIndex) })
++
++	iface := func(name string, ip netip.Addr) Interface {
++		return Interface{
++			Interface: &net.Interface{Name: name, Flags: net.FlagUp},
++			AltAddrs:  []net.Addr{netipx.AddrIPNet(ip)},
++		}
++	}
++	lan := netip.MustParseAddr("100.70.1.9")
++	otherVPN := netip.MustParseAddr("100.82.2.3")
++	chromeOS := netip.MustParseAddr("100.115.92.1")
++	ula := iface("lan6", netip.MustParseAddr("fd7a:115c:a1e0:2::9"))
++	mixed := []Interface{
++		iface("lan", lan),
++		iface("wg0", netip.MustParseAddr("100.70.1.10")),
++		iface("tailscale0", otherVPN),
++		iface("arc0", chromeOS),
++		ula,
++	}
++	for _, tc := range []struct {
++		name, registered string
++		ifaces           []Interface
++		want             []netip.Addr
++	}{
++		{"unregistered", "", mixed, []netip.Addr{chromeOS}},
++		{"registered", "wg0", mixed, []netip.Addr{lan, otherVPN, chromeOS}},
++		{"registered-ULA-only", "wg0", []Interface{ula}, nil},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			tsIfProps.set(tc.registered, 0)
++			tstest.Replace(t, &altNetInterfaces, func() ([]Interface, error) { return tc.ifaces, nil })
++			got, _, err := LocalAddresses()
++			if err != nil {
++				t.Fatal(err)
++			}
++			if !slices.Equal(got, tc.want) {
++				t.Errorf("LocalAddresses = %v, want %v", got, tc.want)
++			}
++		})
++	}
++}
++
+ func TestLocalAddressesSkipsTailscaleInterface(t *testing.T) {
+ 	up := net.FlagUp | net.FlagBroadcast | net.FlagMulticast | net.FlagRunning
+ 	tstest.Replace(t, &altNetInterfaces, func() ([]Interface, error) {
+diff --git a/net/netmon/state.go b/net/netmon/state.go
+index 6463f41d89328aa4c8fd98ec99eee290688391dd..7352facba73f181dcf7c0e5424e89d2e1b976f67 100644
+--- a/net/netmon/state.go
++++ b/net/netmon/state.go
+@@ -89,12 +89,9 @@ func LocalAddresses() (regular, loopback []netip.Addr, err error) {
+ 					continue
+ 				}
+ 				ip = ip.Unmap()
+-				// TODO(apenwarr): don't special case cgNAT.
+-				// In the general wireguard case, it might
+-				// very well be something we can route to
+-				// directly, because both nodes are
+-				// behind the same CGNAT router.
+-				if tsaddr.IsTailscaleIP(ip) {
++				// Once the tunnel is identified by name, CGNAT IPv4 addresses
++				// on other interfaces are candidates for a direct path.
++				if tsaddr.IsTailscaleIP(ip) && (tsIfName == "" || ip.Is6()) {
+ 					continue
+ 				}
+ 				if ip.IsLoopback() || ifcIsLoopback {
