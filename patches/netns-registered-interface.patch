@@ -1,0 +1,267 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Brody Franks <brody@franks.id.au>
+Date: Thu, 19 Nov 2026 17:23:19 -0800
+Subject: [PATCH] net/netns: resolve the registered Darwin tunnel by name
+
+A utun with an address in Tailscale's ranges can belong to another
+VPN, and the registered tunnel can use other addresses. Resolve the
+registered name to its current kernel interface at socket setup.
+
+If a destination route selects the tunnel, try the default interface.
+Reject a default that selects the registered tunnel. With no registered
+name and a monitor, let Darwin choose the interface when the default
+matches the utun address heuristic.
+
+Change-Id: I5f1219028efa14606970c5a5d4193aa6388d74f9
+Signed-off-by: Brody Franks <brody@franks.id.au>
+---
+ net/netns/netns_darwin.go      | 58 ++++++++++++++++---------
+ net/netns/netns_darwin_test.go | 96 +++++++++++++++++++++++++++++++++++++++++-
+ 2 files changed, 134 insertions(+), 20 deletions(-)
+
+diff --git a/net/netns/netns_darwin.go b/net/netns/netns_darwin.go
+index 844128ddaca7d3bd8aafd77783de761d6d59c0eb..01acb84060032d751b5c5d50fbab8360619f74ef 100644
+--- a/net/netns/netns_darwin.go
++++ b/net/netns/netns_darwin.go
+@@ -33,6 +33,7 @@ func control(logf logger.Logf, netMon *netmon.Monitor) func(network, address str
+ var bindToInterfaceByRouteEnv = envknob.RegisterBool("TS_BIND_TO_INTERFACE_BY_ROUTE")
+ 
+ var errInterfaceStateInvalid = errors.New("interface state invalid")
++var errTunnelUnderlay = errors.New("default route selects the tunnel interface")
+ 
+ // controlLogf binds c to a particular interface as necessary to dial the
+ // provided (network, address).
+@@ -47,6 +48,9 @@ func controlLogf(logf logger.Logf, netMon *netmon.Monitor, network, address stri
+ 
+ 	idx, err := getInterfaceIndex(logf, netMon, address)
+ 	if err != nil {
++		if errors.Is(err, errTunnelUnderlay) {
++			return err
++		}
+ 		// callee logged
+ 		return nil
+ 	}
+@@ -55,6 +59,8 @@ func controlLogf(logf logger.Logf, netMon *netmon.Monitor, network, address stri
+ }
+ 
+ func getInterfaceIndex(logf logger.Logf, netMon *netmon.Monitor, address string) (int, error) {
++	registeredName, _ := netmon.TailscaleInterfaceName()
++
+ 	// Helper so we can log errors.
+ 	defaultIdx := func() (int, error) {
+ 		if netMon == nil {
+@@ -68,7 +74,10 @@ func getInterfaceIndex(logf logger.Logf, netMon *netmon.Monitor, address string)
+ 				}
+ 				return -1, err
+ 			}
+-			return idx, nil
++			if registeredName == "" {
++				return idx, nil
++			}
++			return checkDefaultInterface(idx, registeredName)
+ 		}
+ 		state := netMon.InterfaceState()
+ 		if state == nil {
+@@ -80,33 +89,24 @@ func getInterfaceIndex(logf logger.Logf, netMon *netmon.Monitor, address string)
+ 		// OSes view (if available) of the default interface
+ 		osIf, osIferr := netmon.OSDefaultRoute()
+ 
+-		idx := -1
+-		errOut := errInterfaceStateInvalid
++		var idx int
+ 		// Preferentially choose the OS's view of the default if index.  Due to the way darwin sets the delegated
+ 		// interface on tunnel creation only, it is possible for netmon to have a stale view of the default and
+ 		// netmon's view is often temporarily wrong during network transitions, or for us to not have the
+ 		// the oses view of the defaultIf yet.
+ 		if osIferr == nil {
+ 			idx = osIf.InterfaceIndex
+-			errOut = nil
+ 		} else if ok {
+ 			idx = cachedIdx.Index
+-			errOut = nil
++		} else {
++			return -1, errInterfaceStateInvalid
+ 		}
+ 
+ 		if osIferr == nil && ok && (osIf.InterfaceIndex != cachedIdx.Index) {
+ 			logf("netns: [unexpected] os default if %q (%d) != netmon cached if %q (%d)", osIf.InterfaceName, osIf.InterfaceIndex, cachedIdx.Name, cachedIdx.Index)
+ 		}
+ 
+-		// Sanity check to make sure we didn't pick the tailscale interface
+-		if tsif, err2 := tailscaleInterface(); tsif != nil && err2 == nil && errOut == nil {
+-			if tsif.Index == idx {
+-				idx = -1
+-				errOut = errInterfaceStateInvalid
+-			}
+-		}
+-
+-		return idx, errOut
++		return checkDefaultInterface(idx, registeredName)
+ 	}
+ 
+ 	useRoute := bindToInterfaceByRoute.Load() || bindToInterfaceByRouteEnv()
+@@ -131,7 +131,7 @@ func getInterfaceIndex(logf logger.Logf, netMon *netmon.Monitor, address string)
+ 
+ 	// Verify that we didn't just choose the Tailscale interface;
+ 	// if so, we fall back to binding from the default.
+-	tsif, err2 := tailscaleInterface()
++	tsif, err2 := tailscaleInterface(registeredName)
+ 	if err2 == nil && tsif != nil && tsif.Index == idx {
+ 		// note: with an exit node enabled, this is almost always true.  defaultIdx() is the
+ 		// right thing to do here.
+@@ -143,10 +143,30 @@ func getInterfaceIndex(logf logger.Logf, netMon *netmon.Monitor, address string)
+ 	return idx, err
+ }
+ 
+-// tailscaleInterface returns the current machine's Tailscale interface, if any.
+-// If none is found, (nil, nil) is returned.
+-// A non-nil error is only returned on a problem listing the system interfaces.
+-func tailscaleInterface() (*net.Interface, error) {
++// checkDefaultInterface rejects a registered tunnel as the default. An
++// address-based match leaves the socket unbound so Darwin can choose its route.
++func checkDefaultInterface(idx int, registeredName string) (int, error) {
++	iface, err := tailscaleInterface(registeredName)
++	if err != nil || iface == nil || iface.Index != idx {
++		return idx, nil
++	}
++	if registeredName == "" {
++		return -1, errInterfaceStateInvalid
++	}
++	return -1, errTunnelUnderlay
++}
++
++// tailscaleInterface resolves a registered name and returns the lookup error
++// if the device is gone. Without a name it returns the first utun with a
++// Tailscale address, or (nil, nil) if the scan finds none.
++func tailscaleInterface(registeredName string) (*net.Interface, error) {
++	if registeredName != "" {
++		return net.InterfaceByName(registeredName)
++	}
++	return guessTailscaleInterface()
++}
++
++var guessTailscaleInterface = func() (*net.Interface, error) {
+ 	ifs, err := net.Interfaces()
+ 	if err != nil {
+ 		return nil, err
+diff --git a/net/netns/netns_darwin_test.go b/net/netns/netns_darwin_test.go
+index 768b095b8273985837747f4db266f3e71a41cf35..2c4c0d8aed5dcb5ebe39f8856ced899ad35d3552 100644
+--- a/net/netns/netns_darwin_test.go
++++ b/net/netns/netns_darwin_test.go
+@@ -4,9 +4,14 @@
+ package netns
+ 
+ import (
++	"errors"
++	"net"
++	"syscall"
+ 	"testing"
+ 
++	"golang.org/x/sys/unix"
+ 	"tailscale.com/net/netmon"
++	"tailscale.com/tstest"
+ )
+ 
+ func TestGetInterfaceIndex(t *testing.T) {
+@@ -55,7 +60,8 @@ func TestGetInterfaceIndex(t *testing.T) {
+ 	}
+ 
+ 	t.Run("NoTailscale", func(t *testing.T) {
+-		tsif, err := tailscaleInterface()
++		name, _ := netmon.TailscaleInterfaceName()
++		tsif, err := tailscaleInterface(name)
+ 		if err != nil {
+ 			t.Fatal(err)
+ 		}
+@@ -82,3 +88,91 @@ func TestGetInterfaceIndex(t *testing.T) {
+ 		}
+ 	})
+ }
++
++func TestMissingRegisteredTunnel(t *testing.T) {
++	tstest.Replace(t, &guessTailscaleInterface, func() (*net.Interface, error) {
++		t.Fatal("scanned for another utun after the registered device disappeared")
++		return nil, nil
++	})
++	if got, err := tailscaleInterface("missing-registered-utun"); err == nil || got != nil {
++		t.Fatalf("removed tunnel = %v, %v", got, err)
++	}
++}
++
++func TestRegisteredTunnelBinding(t *testing.T) {
++	name, _ := netmon.TailscaleInterfaceName()
++	index, _ := netmon.TailscaleInterfaceIndex()
++	t.Cleanup(func() { netmon.SetTailscaleInterfaceProps(name, index) })
++
++	idx, err := netmon.DefaultRouteInterfaceIndex()
++	if errors.Is(err, netmon.ErrNoGatewayIndexFound) {
++		t.Skip("requires a default route")
++	}
++	if err != nil {
++		t.Fatal(err)
++	}
++	def, err := net.InterfaceByIndex(idx)
++	if err != nil {
++		t.Fatal(err)
++	}
++	lo, err := net.InterfaceByName("lo0")
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	mon := netmon.NewStatic()
++	for _, tc := range []struct {
++		name       string
++		monitor    *netmon.Monitor
++		registered string
++		savedIndex int
++		guess      *net.Interface
++		wantIndex  int
++		wantErr    error
++	}{
++		{"registered/monitored", mon, def.Name, lo.Index, nil, 0, errTunnelUnderlay},
++		{"registered/unmonitored", nil, def.Name, lo.Index, nil, 0, errTunnelUnderlay},
++		{"heuristic/monitored", mon, "", 0, def, 0, nil},
++		{"heuristic/unmonitored", nil, "", 0, def, idx, nil},
++		{"no-match/monitored", mon, "", 0, nil, idx, nil},
++		{"no-match/unmonitored", nil, "", 0, nil, idx, nil},
++		// The registered index may now belong to another device.
++		{"reused-index/monitored", mon, lo.Name, idx, def, idx, nil},
++		{"reused-index/unmonitored", nil, lo.Name, idx, def, idx, nil},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			netmon.SetTailscaleInterfaceProps(tc.registered, tc.savedIndex)
++			tstest.Replace(t, &guessTailscaleInterface, func() (*net.Interface, error) { return tc.guess, nil })
++			got, err := listenDefaultInterface(t, tc.monitor)
++			if !errors.Is(err, tc.wantErr) {
++				t.Fatalf("ListenPacket: %v, want %v", err, tc.wantErr)
++			}
++			if err == nil && got != tc.wantIndex {
++				t.Errorf("IP_BOUND_IF = %d, want %d", got, tc.wantIndex)
++			}
++		})
++	}
++}
++
++func listenDefaultInterface(t *testing.T, mon *netmon.Monitor) (int, error) {
++	t.Helper()
++	var bound int
++	lc := net.ListenConfig{Control: func(network, _ string, c syscall.RawConn) error {
++		// An empty destination host selects the default in either route mode.
++		if err := controlLogf(t.Logf, mon, network, ":0", c); err != nil {
++			return err
++		}
++		var optErr error
++		if err := c.Control(func(fd uintptr) {
++			bound, optErr = unix.GetsockoptInt(int(fd), unix.IPPROTO_IP, unix.IP_BOUND_IF)
++		}); err != nil {
++			return err
++		}
++		return optErr
++	}}
++	conn, err := lc.ListenPacket(t.Context(), "udp4", ":0")
++	if err == nil {
++		conn.Close()
++	}
++	return bound, err
++}
