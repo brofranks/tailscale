@@ -320,14 +320,11 @@ var (
 	wikimediaDNSv4Addr = netip.MustParseAddr(wikimediaDNSv4)
 	wikimediaDNSv6Addr = netip.MustParseAddr(wikimediaDNSv6)
 
-	// The Control D IPv6 ranges (primary and secondary). The customer ID is
-	// encoded in the ipv6 address is used (in base 36 form) as the DoH query
-	controlDv6RangeA = netip.MustParsePrefix("2606:1a40::/48")
-	controlDv6RangeB = netip.MustParsePrefix("2606:1a40:1::/48")
-	controlDv4One    = netip.MustParseAddr("76.76.2.22")
-	controlDv4Two    = netip.MustParseAddr("76.76.10.22")
-	controlDv6One    = netip.MustParseAddr("2606:1a40::22")
-	controlDv6Two    = netip.MustParseAddr("2606:1a40:1::22")
+	// Bootstrap addresses for Control D's premium DoH endpoint.
+	controlDv4One = netip.MustParseAddr("76.76.2.22")
+	controlDv4Two = netip.MustParseAddr("76.76.10.22")
+	controlDv6One = netip.MustParseAddr("2606:1a40::22")
+	controlDv6Two = netip.MustParseAddr("2606:1a40:1::22")
 )
 
 // nextDNSv6Gen generates a NextDNS IPv6 address from the upper 8 bytes in the
@@ -347,7 +344,7 @@ func IPIsDoHOnlyServer(ip netip.Addr) bool {
 	return nextDNSv6RangeA.Contains(ip) || nextDNSv6RangeB.Contains(ip) ||
 		nextDNSv4RangeA.Contains(ip) || nextDNSv4RangeB.Contains(ip) ||
 		ip == wikimediaDNSv4Addr || ip == wikimediaDNSv6Addr ||
-		controlDv6RangeA.Contains(ip) || controlDv6RangeB.Contains(ip) ||
+		ip == controlDv6One || ip == controlDv6Two ||
 		ip == controlDv4One || ip == controlDv4Two
 }
 

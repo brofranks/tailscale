@@ -23,6 +23,7 @@ import (
 	"tailscale.com/envknob"
 	"tailscale.com/feature/buildfeatures"
 	"tailscale.com/health"
+	"tailscale.com/net/dns/publicdns"
 	"tailscale.com/net/dns/resolver"
 	"tailscale.com/net/netmon"
 	"tailscale.com/net/tsdial"
@@ -631,14 +632,16 @@ func (m *Manager) reapplyConfig() error {
 
 var isSandboxedMacOS = version.IsSandboxedMacOS
 
-// toIPsOnly returns only the IP portion of dnstype.Resolver.
-// Only safe to use if the resolvers slice has been cleared of
-// DoH or custom-port entries with something like hasDefaultIPResolversOnly.
+// toIPsOnly returns the IP portion of resolvers. It returns nil if any of
+// them needs the local forwarder: a DoH URL, a custom port or a DoH-only
+// server.
 func toIPsOnly(resolvers []*dnstype.Resolver) (ret []netip.Addr) {
 	for _, r := range resolvers {
-		if ipp, ok := r.IPPort(); ok && ipp.Port() == 53 {
-			ret = append(ret, ipp.Addr())
+		ipp, ok := r.IPPort()
+		if !ok || ipp.Port() != 53 || publicdns.IPIsDoHOnlyServer(ipp.Addr()) {
+			return nil
 		}
+		ret = append(ret, ipp.Addr())
 	}
 	return ret
 }

@@ -494,6 +494,17 @@ func TestManager(t *testing.T) {
 			},
 		},
 		{
+			name: "routes-split-controld-legacy",
+			in: Config{
+				Routes: upstreams("corp.example", "2606:1a40::1234", "2606:1a40:1::1234"),
+			},
+			split: true,
+			os: OSConfig{
+				Nameservers:  mustIPs("2606:1a40::1234", "2606:1a40:1::1234"),
+				MatchDomains: fqdns("corp.example"),
+			},
+		},
+		{
 			// A custom split resolver requires Mode B even with macOS scoping
 			// enabled: otherwise the split suffix becomes a global search suffix.
 			name: "routes-split-sandboxed-darwin",
@@ -1438,6 +1449,49 @@ func baseConfigRetryTotal() time.Duration {
 		d *= 2
 	}
 	return total
+}
+
+// The OS can represent a split route directly only when it can use every
+// upstream at port 53. Otherwise the local resolver keeps the complete route.
+func TestSplitDNSRequiresProxy(t *testing.T) {
+	const suffix = "corp.example."
+	for _, tc := range []struct {
+		name            string
+		upstreams, want []*dnstype.Resolver
+	}{
+		{
+			"doh-only",
+			mustRes("2a07:a8c0::1234"),
+			mustRes("https://dns.nextdns.io/1234"),
+		},
+		{
+			"mixed-doh",
+			mustRes("192.0.2.53", "https://dns.example/dns-query"),
+			mustRes("192.0.2.53", "https://dns.example/dns-query"),
+		},
+		{
+			"mixed-ports",
+			mustRes("192.0.2.53", "192.0.2.54:5353"),
+			mustRes("192.0.2.53", "192.0.2.54:5353"),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m, f, _ := newEmptyBaseConfigManager(t)
+			f.SplitDNS = true
+			cfg := Config{Routes: map[dnsname.FQDN][]*dnstype.Resolver{suffix: tc.upstreams}}
+			if err := m.Set(cfg); err != nil {
+				t.Fatal(err)
+			}
+			if !slices.Equal(f.OSConfig.Nameservers, serviceAddr46) ||
+				!slices.Equal(f.OSConfig.MatchDomains, []dnsname.FQDN{suffix}) {
+				t.Fatalf("OS nameservers %v, domains %v", f.OSConfig.Nameservers, f.OSConfig.MatchDomains)
+			}
+			got := m.Resolver().GetUpstreamResolvers("node.corp.example.")
+			if diff := cmp.Diff(tc.want, got); diff != "" {
+				t.Fatalf("forwarders (-want +got):\n%s", diff)
+			}
+		})
+	}
 }
 
 // splitDNSOnlyConfig returns a config with a route and MagicDNS but no
