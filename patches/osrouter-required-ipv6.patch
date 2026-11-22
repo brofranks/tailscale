@@ -9,18 +9,32 @@ Up succeeds. Report whether the router selected IPv6 at startup and
 still considers it usable on the current backend and tunnel. A router
 started without IPv6 needs a restart to acquire it.
 
+Read the tunnel's disable_ipv6 setting as an integer so every nonzero
+value marks the tunnel unavailable.
+
 Change-Id: I5b0e6f3a8d2c4e71a9f0b6c3d8e2a4f1b7c9d0e3
 Signed-off-by: Brody Franks <brody@franks.id.au>
 ---
- wgengine/router/osrouter/router_linux.go      |  9 ++++++++
- wgengine/router/osrouter/router_linux_test.go | 33 +++++++++++++++++++++++++++
- 2 files changed, 42 insertions(+)
+ wgengine/router/osrouter/router_linux.go      | 21 ++++++---
+ wgengine/router/osrouter/router_linux_test.go | 63 +++++++++++++++++++++++++++
+ 2 files changed, 79 insertions(+), 5 deletions(-)
 
 diff --git a/wgengine/router/osrouter/router_linux.go b/wgengine/router/osrouter/router_linux.go
-index bc2562a281ed61140341e9b09d2006214915d4a9..bfc823b6bcec6bbd26543871dd646b82320fd5f7 100644
+index bc2562a281ed61140341e9b09d2006214915d4a9..70c18460a5305421d373f8a4aa3a7ff59ef59a09 100644
 --- a/wgengine/router/osrouter/router_linux.go
 +++ b/wgengine/router/osrouter/router_linux.go
-@@ -386,6 +386,15 @@ func (r *linuxRouter) restoreIPRules() {
+@@ -145,7 +145,9 @@ func newUserspaceRouterAdvanced(logf logger.Logf, tunname string, netMon *netmon
+ 		ipRuleFixLimiter: rate.NewLimiter(rate.Every(5*time.Second), 10),
+ 		ipPolicyPrefBase: 5200,
+ 	}
+-	r.interfaceV6Usable = func() bool { return interfaceV6UsableForTun(r.tunname) }
++	r.interfaceV6Usable = func() bool {
++		return interfaceV6UsableForTun("/proc/sys/net/ipv6/conf", r.tunname)
++	}
+ 	ec := bus.Client("router-linux")
+ 	r.rulesAddedPub = eventbus.Publish[AddIPRules](ec)
+ 	eventbus.SubscribeFunc(ec, func(rs netmon.RuleDeleted) {
+@@ -386,6 +388,15 @@ func (r *linuxRouter) restoreIPRules() {
  	r.justAddIPRules(families)
  }
  
@@ -36,11 +50,49 @@ index bc2562a281ed61140341e9b09d2006214915d4a9..bfc823b6bcec6bbd26543871dd646b82
  func (r *linuxRouter) Up() error {
  	r.mu.Lock()
  	defer r.mu.Unlock()
+@@ -990,13 +1001,13 @@ func (r *linuxRouter) snapshotV6Usable() func() {
+ // once IPv6 is up on the interface (e.g. an MTU below the 1280-byte IPv6
+ // minimum removes it entirely), and disable_ipv6 within it reflects whether
+ // IPv6 has since been turned off explicitly.
+-func interfaceV6UsableForTun(tunname string) bool {
++func interfaceV6UsableForTun(confDir, tunname string) bool {
+ 	if tunname == "" {
+ 		return false
+ 	}
+ 	// Open under conf/ with os.OpenInRoot so a "../" or symlink in tunname can't
+ 	// escape the directory.
+-	f, err := os.OpenInRoot("/proc/sys/net/ipv6/conf", filepath.Join(tunname, "disable_ipv6"))
++	f, err := os.OpenInRoot(confDir, filepath.Join(tunname, "disable_ipv6"))
+ 	if err != nil {
+ 		// A missing directory/knob means IPv6 isn't up on the interface, so it's
+ 		// unavailable. Any other error (e.g. EACCES, or tunname escaping the
+@@ -1009,11 +1020,11 @@ func interfaceV6UsableForTun(tunname string) bool {
+ 	if err != nil {
+ 		return true // couldn't read; assume usable
+ 	}
+-	disabled, err := strconv.ParseBool(strings.TrimSpace(string(bs)))
++	disabled, err := strconv.Atoi(strings.TrimSpace(string(bs)))
+ 	if err != nil {
+ 		return true // unparseable; assume usable
+ 	}
+-	return !disabled
++	return disabled == 0
+ }
+ 
+ // addAddress adds an IP/mask to the tunnel interface. Fails if the
 diff --git a/wgengine/router/osrouter/router_linux_test.go b/wgengine/router/osrouter/router_linux_test.go
-index af22d32f7827c08dbfba682b319d4ed2244dae17..bd212a990305f1e99a58f6ed5837633dbb2e6bba 100644
+index af22d32f7827c08dbfba682b319d4ed2244dae17..455ffa963db24dadf8b140252b10c3419e27e8ab 100644
 --- a/wgengine/router/osrouter/router_linux_test.go
 +++ b/wgengine/router/osrouter/router_linux_test.go
-@@ -1783,6 +1783,39 @@ func TestCloseUsesInstalledRuleFamilies(t *testing.T) {
+@@ -9,6 +9,7 @@
+ 	"math/rand"
+ 	"net/netip"
+ 	"os"
++	"path/filepath"
+ 	"reflect"
+ 	"regexp"
+ 	"runtime"
+@@ -1783,6 +1784,68 @@ func TestCloseUsesInstalledRuleFamilies(t *testing.T) {
  	}
  }
  
@@ -72,6 +124,35 @@ index af22d32f7827c08dbfba682b319d4ed2244dae17..bd212a990305f1e99a58f6ed5837633d
 +			backend.noV6 = !available
 +			if got := r.IPv6Available(); got != available {
 +				t.Fatalf("backend HasIPV6 = %t, IPv6Available = %t", available, got)
++			}
++		}
++	})
++
++	t.Run("tunnel-disable-ipv6", func(t *testing.T) {
++		r, _ := newTestLinuxRouter(t)
++		root := t.TempDir()
++		dir := filepath.Join(root, r.tunname)
++		if err := os.Mkdir(dir, 0o700); err != nil {
++			t.Fatal(err)
++		}
++		path := filepath.Join(dir, "disable_ipv6")
++		r.interfaceV6Usable = func() bool { return interfaceV6UsableForTun(root, r.tunname) }
++		for _, tc := range []struct {
++			setting string
++			want    bool
++		}{
++			{"0", true},
++			{"1", false},
++			{"2", false},
++			{"-1", false},
++			{"invalid", true},
++			{"0", true},
++		} {
++			if err := os.WriteFile(path, []byte(tc.setting+"\n"), 0o600); err != nil {
++				t.Fatal(err)
++			}
++			if got := r.IPv6Available(); got != tc.want {
++				t.Errorf("disable_ipv6=%q: IPv6Available() = %v, want %v", tc.setting, got, tc.want)
 +			}
 +		}
 +	})
