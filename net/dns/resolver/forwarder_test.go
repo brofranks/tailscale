@@ -142,6 +142,16 @@ func TestResolversWithDelays(t *testing.T) {
 			want: o("https://dns.nextdns.io/c3a884"),
 		},
 		{
+			name: "custom-ports",
+			in:   q("8.8.8.8:5353", "[2a07:a8c0::1234]:5353"),
+			want: o("8.8.8.8:5353", "[2a07:a8c0::1234]:5353"),
+		},
+		{
+			name: "same-provider-standard-and-custom-port",
+			in:   q("[2a07:a8c0::1234]:53", "[2a07:a8c0::1234]:5353"),
+			want: o("https://dns.nextdns.io/1234", "[2a07:a8c0::1234]:5353"),
+		},
+		{
 			name: "nextdns-doh-input",
 			in:   q("https://dns.nextdns.io/c3a884"),
 			want: o("https://dns.nextdns.io/c3a884"),

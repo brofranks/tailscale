@@ -379,7 +379,8 @@ func (f *forwarder) Close() error {
 
 // resolversWithDelays maps from a set of DNS server names to a slice of a type
 // that included a startDelay, upgrading any well-known DoH (DNS-over-HTTP)
-// servers in the process, insert a DoH lookup first before UDP fallbacks.
+// servers on port 53 in the process, insert a DoH lookup first before UDP
+// fallbacks.
 func resolversWithDelays(resolvers []*dnstype.Resolver) []resolverAndDelay {
 	rr := make([]resolverAndDelay, 0, len(resolvers)+2)
 
@@ -391,7 +392,7 @@ func resolversWithDelays(resolvers []*dnstype.Resolver) []resolverAndDelay {
 	didDoH := map[string]dohState{}
 	for _, r := range resolvers {
 		ipp, ok := r.IPPort()
-		if !ok {
+		if !ok || ipp.Port() != 53 {
 			continue
 		}
 		dohBase, dohOnly, ok := publicdns.DoHEndpointFromIP(ipp.Addr())
@@ -413,9 +414,9 @@ func resolversWithDelays(resolvers []*dnstype.Resolver) []resolverAndDelay {
 	done := map[hostAndFam]int{}
 	for _, r := range resolvers {
 		ipp, ok := r.IPPort()
-		if !ok {
-			// Pass non-IP ones through unchanged, without delay.
-			// (e.g. DNS-over-ExitDNS when using an exit node)
+		if !ok || ipp.Port() != 53 {
+			// Explicit endpoints, including custom ports and DNS-over-ExitDNS
+			// URLs, keep their transport and start without a delay.
 			rr = append(rr, resolverAndDelay{name: r})
 			continue
 		}
