@@ -1,0 +1,100 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Brody Franks <brody@franks.id.au>
+Date: Thu, 19 Nov 2026 13:58:46 -0800
+Subject: [PATCH] net/netmon: clear the Darwin default route hint on path loss
+
+An Apple network extension can report an empty path while the previous
+interface is still up and numbered. Clear the saved interface on an
+empty report so default route discovery can use the routing table until
+the provider supplies a new interface.
+
+TestUpdateLastKnownDefaultRouteInterface left its interface saved for
+later tests. Restore the previous value when it ends.
+
+Change-Id: Id4588aaea2232068491c9aeb07d337e4616389c3
+Signed-off-by: Brody Franks <brody@franks.id.au>
+---
+ net/netmon/defaultroute_darwin.go    | 10 ++++------
+ net/netmon/interfaces_darwin_test.go | 31 +++++++++++++++++++++++++++++++
+ 2 files changed, 35 insertions(+), 6 deletions(-)
+
+diff --git a/net/netmon/defaultroute_darwin.go b/net/netmon/defaultroute_darwin.go
+index 121535937bc22685d058e88cd69a2d99fae673e9..bce66f6550444ad3006e27d579e0e2a643878ae6 100644
+--- a/net/netmon/defaultroute_darwin.go
++++ b/net/netmon/defaultroute_darwin.go
+@@ -18,13 +18,11 @@
+ 	lastKnownDefaultRouteIfName syncs.AtomicValue[string]
+ )
+ 
+-// UpdateLastKnownDefaultRouteInterface is called by ipn-go-bridge from apple network extensions when
+-// our NWPathMonitor instance detects a network path transition.
++// UpdateLastKnownDefaultRouteInterface records the default interface reported
++// by an Apple network extension's NWPathMonitor. An empty name clears the hint
++// so defaultRoute can consult the BSD routing table.
+ func UpdateLastKnownDefaultRouteInterface(ifName string) {
+-	if ifName == "" {
+-		return
+-	}
+-	if old := lastKnownDefaultRouteIfName.Swap(ifName); old != ifName {
++	if old := lastKnownDefaultRouteIfName.Swap(ifName); old != ifName && ifName != "" {
+ 		interfaces, err := netInterfaces()
+ 		if err != nil {
+ 			log.Printf("defaultroute_darwin: UpdateLastKnownDefaultRouteInterface could not get interfaces: %v", err)
+diff --git a/net/netmon/interfaces_darwin_test.go b/net/netmon/interfaces_darwin_test.go
+index e4b84a144a432f08851252bb0995b06482dcbfa2..ebebce07d34623418f0b7628a394a350103a0857 100644
+--- a/net/netmon/interfaces_darwin_test.go
++++ b/net/netmon/interfaces_darwin_test.go
+@@ -5,11 +5,13 @@
+ 
+ import (
+ 	"io"
++	"net"
+ 	"net/netip"
+ 	"os/exec"
+ 	"testing"
+ 
+ 	"go4.org/mem"
++	"tailscale.com/tstest"
+ 	"tailscale.com/util/lineiter"
+ 	"tailscale.com/version"
+ )
+@@ -114,6 +116,9 @@ func TestFetchRoutingTable(t *testing.T) {
+ }
+ 
+ func TestUpdateLastKnownDefaultRouteInterface(t *testing.T) {
++	old := lastKnownDefaultRouteIfName.Load()
++	t.Cleanup(func() { lastKnownDefaultRouteIfName.Store(old) })
++
+ 	// Pick some interface on the machine
+ 	interfaces, err := netInterfaces()
+ 	if err != nil || len(interfaces) == 0 {
+@@ -134,3 +139,29 @@ func TestUpdateLastKnownDefaultRouteInterface(t *testing.T) {
+ 		t.Errorf("OSDefaultRoute() = %q, want %q", got, want)
+ 	}
+ }
++
++func TestDefaultRouteWithdrawal(t *testing.T) {
++	old := lastKnownDefaultRouteIfName.Load()
++	t.Cleanup(func() { lastKnownDefaultRouteIfName.Store(old) })
++	// Both links stay up and numbered throughout the transition.
++	var links []Interface
++	for i, name := range []string{"link1", "link2"} {
++		links = append(links, Interface{
++			Interface: &net.Interface{Name: name, Index: i + 1, Flags: net.FlagUp},
++			AltAddrs:  []net.Addr{&net.IPAddr{IP: net.IPv4(192, 0, 2, byte(i+1))}},
++		})
++	}
++	tstest.Replace(t, &altNetInterfaces, func() ([]Interface, error) { return links, nil })
++
++	for _, want := range []DefaultRouteDetails{
++		{InterfaceName: "link1", InterfaceIndex: 1},
++		{},
++		{InterfaceName: "link2", InterfaceIndex: 2},
++	} {
++		UpdateLastKnownDefaultRouteInterface(want.InterfaceName)
++		got, err := OSDefaultRoute()
++		if got != want || (err != nil) != (want.InterfaceName == "") {
++			t.Fatalf("after %q: OSDefaultRoute() = %+v, %v; want %+v", want.InterfaceName, got, err, want)
++		}
++	}
++}
