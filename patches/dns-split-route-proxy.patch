@@ -1,0 +1,162 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Brody Franks <brody@franks.id.au>
+Date: Sun, 22 Nov 2026 10:32:36 -0800
+Subject: [PATCH] net/dns: keep a split route with a proxied upstream in the
+ forwarder
+
+A split route whose domains all share one resolver set is handed to the
+OS directly. That dropped DoH and custom-port upstreams from the set and
+published a DoH-only server as a plain nameserver. Keep the whole route
+in the local forwarder unless the OS can use every upstream at port 53.
+
+Allow the OS to use Control D's legacy IPv6 resolvers directly. Only
+the specific Control D bootstrap addresses retain their existing
+DoH-only classification.
+
+Change-Id: Ida4f5fed39260af74b3f1745096313ef02598e46
+Signed-off-by: Brody Franks <brody@franks.id.au>
+---
+ net/dns/manager.go             | 13 ++++++----
+ net/dns/manager_test.go        | 54 ++++++++++++++++++++++++++++++++++++++++
+ net/dns/publicdns/publicdns.go | 15 +++++------
+ 3 files changed, 68 insertions(+), 14 deletions(-)
+
+diff --git a/net/dns/manager.go b/net/dns/manager.go
+index 8defe8f47bf9141461537ff71c89cf61e0f074cb..ef049ada945b8de91d85a1e1a422d568a1868aa4 100644
+--- a/net/dns/manager.go
++++ b/net/dns/manager.go
+@@ -23,6 +23,7 @@
+ 	"tailscale.com/envknob"
+ 	"tailscale.com/feature/buildfeatures"
+ 	"tailscale.com/health"
++	"tailscale.com/net/dns/publicdns"
+ 	"tailscale.com/net/dns/resolver"
+ 	"tailscale.com/net/netmon"
+ 	"tailscale.com/net/tsdial"
+@@ -631,14 +632,16 @@ func (m *Manager) reapplyConfig() error {
+ 
+ var isSandboxedMacOS = version.IsSandboxedMacOS
+ 
+-// toIPsOnly returns only the IP portion of dnstype.Resolver.
+-// Only safe to use if the resolvers slice has been cleared of
+-// DoH or custom-port entries with something like hasDefaultIPResolversOnly.
++// toIPsOnly returns the IP portion of resolvers. It returns nil if any of
++// them needs the local forwarder: a DoH URL, a custom port or a DoH-only
++// server.
+ func toIPsOnly(resolvers []*dnstype.Resolver) (ret []netip.Addr) {
+ 	for _, r := range resolvers {
+-		if ipp, ok := r.IPPort(); ok && ipp.Port() == 53 {
+-			ret = append(ret, ipp.Addr())
++		ipp, ok := r.IPPort()
++		if !ok || ipp.Port() != 53 || publicdns.IPIsDoHOnlyServer(ipp.Addr()) {
++			return nil
+ 		}
++		ret = append(ret, ipp.Addr())
+ 	}
+ 	return ret
+ }
+diff --git a/net/dns/manager_test.go b/net/dns/manager_test.go
+index 2231c6f2d37044bd746920932ab82c121212fa4c..5caab9c58ebf5eb96c44aa5e0c8854bb06b4edf3 100644
+--- a/net/dns/manager_test.go
++++ b/net/dns/manager_test.go
+@@ -493,6 +493,17 @@ func TestManager(t *testing.T) {
+ 				MatchDomains:  fqdns("corp.com"),
+ 			},
+ 		},
++		{
++			name: "routes-split-controld-legacy",
++			in: Config{
++				Routes: upstreams("corp.example", "2606:1a40::1234", "2606:1a40:1::1234"),
++			},
++			split: true,
++			os: OSConfig{
++				Nameservers:  mustIPs("2606:1a40::1234", "2606:1a40:1::1234"),
++				MatchDomains: fqdns("corp.example"),
++			},
++		},
+ 		{
+ 			// A custom split resolver requires Mode B even with macOS scoping
+ 			// enabled: otherwise the split suffix becomes a global search suffix.
+@@ -1440,6 +1451,49 @@ func baseConfigRetryTotal() time.Duration {
+ 	return total
+ }
+ 
++// The OS can represent a split route directly only when it can use every
++// upstream at port 53. Otherwise the local resolver keeps the complete route.
++func TestSplitDNSRequiresProxy(t *testing.T) {
++	const suffix = "corp.example."
++	for _, tc := range []struct {
++		name            string
++		upstreams, want []*dnstype.Resolver
++	}{
++		{
++			"doh-only",
++			mustRes("2a07:a8c0::1234"),
++			mustRes("https://dns.nextdns.io/1234"),
++		},
++		{
++			"mixed-doh",
++			mustRes("192.0.2.53", "https://dns.example/dns-query"),
++			mustRes("192.0.2.53", "https://dns.example/dns-query"),
++		},
++		{
++			"mixed-ports",
++			mustRes("192.0.2.53", "192.0.2.54:5353"),
++			mustRes("192.0.2.53", "192.0.2.54:5353"),
++		},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			m, f, _ := newEmptyBaseConfigManager(t)
++			f.SplitDNS = true
++			cfg := Config{Routes: map[dnsname.FQDN][]*dnstype.Resolver{suffix: tc.upstreams}}
++			if err := m.Set(cfg); err != nil {
++				t.Fatal(err)
++			}
++			if !slices.Equal(f.OSConfig.Nameservers, serviceAddr46) ||
++				!slices.Equal(f.OSConfig.MatchDomains, []dnsname.FQDN{suffix}) {
++				t.Fatalf("OS nameservers %v, domains %v", f.OSConfig.Nameservers, f.OSConfig.MatchDomains)
++			}
++			got := m.Resolver().GetUpstreamResolvers("node.corp.example.")
++			if diff := cmp.Diff(tc.want, got); diff != "" {
++				t.Fatalf("forwarders (-want +got):\n%s", diff)
++			}
++		})
++	}
++}
++
+ // splitDNSOnlyConfig returns a config with a route and MagicDNS but no
+ // DefaultResolvers, so the "." route can only come from the OS base config.
+ func splitDNSOnlyConfig() Config {
+diff --git a/net/dns/publicdns/publicdns.go b/net/dns/publicdns/publicdns.go
+index fe4d1caa6a07547c9f0038a1f598a6ae03068fcc..15f0af20b1c3e62d3b77ce8e0059815143e691d6 100644
+--- a/net/dns/publicdns/publicdns.go
++++ b/net/dns/publicdns/publicdns.go
+@@ -320,14 +320,11 @@ func populate() {
+ 	wikimediaDNSv4Addr = netip.MustParseAddr(wikimediaDNSv4)
+ 	wikimediaDNSv6Addr = netip.MustParseAddr(wikimediaDNSv6)
+ 
+-	// The Control D IPv6 ranges (primary and secondary). The customer ID is
+-	// encoded in the ipv6 address is used (in base 36 form) as the DoH query
+-	controlDv6RangeA = netip.MustParsePrefix("2606:1a40::/48")
+-	controlDv6RangeB = netip.MustParsePrefix("2606:1a40:1::/48")
+-	controlDv4One    = netip.MustParseAddr("76.76.2.22")
+-	controlDv4Two    = netip.MustParseAddr("76.76.10.22")
+-	controlDv6One    = netip.MustParseAddr("2606:1a40::22")
+-	controlDv6Two    = netip.MustParseAddr("2606:1a40:1::22")
++	// Bootstrap addresses for Control D's premium DoH endpoint.
++	controlDv4One = netip.MustParseAddr("76.76.2.22")
++	controlDv4Two = netip.MustParseAddr("76.76.10.22")
++	controlDv6One = netip.MustParseAddr("2606:1a40::22")
++	controlDv6Two = netip.MustParseAddr("2606:1a40:1::22")
+ )
+ 
+ // nextDNSv6Gen generates a NextDNS IPv6 address from the upper 8 bytes in the
+@@ -347,7 +344,7 @@ func IPIsDoHOnlyServer(ip netip.Addr) bool {
+ 	return nextDNSv6RangeA.Contains(ip) || nextDNSv6RangeB.Contains(ip) ||
+ 		nextDNSv4RangeA.Contains(ip) || nextDNSv4RangeB.Contains(ip) ||
+ 		ip == wikimediaDNSv4Addr || ip == wikimediaDNSv6Addr ||
+-		controlDv6RangeA.Contains(ip) || controlDv6RangeB.Contains(ip) ||
++		ip == controlDv6One || ip == controlDv6Two ||
+ 		ip == controlDv4One || ip == controlDv4Two
+ }
+ 
