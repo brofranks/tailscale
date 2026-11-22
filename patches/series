@@ -13,3 +13,4 @@ magicsock-newconn-cleanup.patch
 osrouter-required-ipv6.patch
 netmon-darwin-path-withdrawal.patch
 dns-forwarder-explicit-port.patch
+dns-split-route-proxy.patch
