@@ -1,0 +1,73 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Brody Franks <brody@franks.id.au>
+Date: Sun, 22 Nov 2026 12:40:20 -0800
+Subject: [PATCH] net/dns/resolver: honor explicit upstream ports
+
+Limit automatic DNS-over-HTTPS upgrades to nameservers on port 53.
+A resolver on another port uses the configured endpoint immediately,
+even when the same IP is also listed on port 53.
+
+Change-Id: I798fd0dadd416b59064cd915b47a9575879a0efa
+Signed-off-by: Brody Franks <brody@franks.id.au>
+---
+ net/dns/resolver/forwarder.go      | 11 ++++++-----
+ net/dns/resolver/forwarder_test.go | 10 ++++++++++
+ 2 files changed, 16 insertions(+), 5 deletions(-)
+
+diff --git a/net/dns/resolver/forwarder.go b/net/dns/resolver/forwarder.go
+index c931ccb01b5232d0140311b6e471e9091d7f5b83..6c768484506c6a77bf31139f8ba746d184540e87 100644
+--- a/net/dns/resolver/forwarder.go
++++ b/net/dns/resolver/forwarder.go
+@@ -379,7 +379,8 @@ func (f *forwarder) Close() error {
+ 
+ // resolversWithDelays maps from a set of DNS server names to a slice of a type
+ // that included a startDelay, upgrading any well-known DoH (DNS-over-HTTP)
+-// servers in the process, insert a DoH lookup first before UDP fallbacks.
++// servers on port 53 in the process, insert a DoH lookup first before UDP
++// fallbacks.
+ func resolversWithDelays(resolvers []*dnstype.Resolver) []resolverAndDelay {
+ 	rr := make([]resolverAndDelay, 0, len(resolvers)+2)
+ 
+@@ -391,7 +392,7 @@ func resolversWithDelays(resolvers []*dnstype.Resolver) []resolverAndDelay {
+ 	didDoH := map[string]dohState{}
+ 	for _, r := range resolvers {
+ 		ipp, ok := r.IPPort()
+-		if !ok {
++		if !ok || ipp.Port() != 53 {
+ 			continue
+ 		}
+ 		dohBase, dohOnly, ok := publicdns.DoHEndpointFromIP(ipp.Addr())
+@@ -413,9 +414,9 @@ type hostAndFam struct {
+ 	done := map[hostAndFam]int{}
+ 	for _, r := range resolvers {
+ 		ipp, ok := r.IPPort()
+-		if !ok {
+-			// Pass non-IP ones through unchanged, without delay.
+-			// (e.g. DNS-over-ExitDNS when using an exit node)
++		if !ok || ipp.Port() != 53 {
++			// Explicit endpoints, including custom ports and DNS-over-ExitDNS
++			// URLs, keep their transport and start without a delay.
+ 			rr = append(rr, resolverAndDelay{name: r})
+ 			continue
+ 		}
+diff --git a/net/dns/resolver/forwarder_test.go b/net/dns/resolver/forwarder_test.go
+index 6e3767992465ee9e7f6e4735c94623e24da4f4a1..065cd730995965e09d97784f3663611390ad7bc6 100644
+--- a/net/dns/resolver/forwarder_test.go
++++ b/net/dns/resolver/forwarder_test.go
+@@ -141,6 +141,16 @@ func TestResolversWithDelays(t *testing.T) {
+ 			in:   q("2a07:a8c0::c3:a884"),
+ 			want: o("https://dns.nextdns.io/c3a884"),
+ 		},
++		{
++			name: "custom-ports",
++			in:   q("8.8.8.8:5353", "[2a07:a8c0::1234]:5353"),
++			want: o("8.8.8.8:5353", "[2a07:a8c0::1234]:5353"),
++		},
++		{
++			name: "same-provider-standard-and-custom-port",
++			in:   q("[2a07:a8c0::1234]:53", "[2a07:a8c0::1234]:5353"),
++			want: o("https://dns.nextdns.io/1234", "[2a07:a8c0::1234]:5353"),
++		},
+ 		{
+ 			name: "nextdns-doh-input",
+ 			in:   q("https://dns.nextdns.io/c3a884"),
