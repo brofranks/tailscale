@@ -28,6 +28,12 @@ jobs:
           GIT_COMMITTER_NAME: github-actions[bot]
           GIT_COMMITTER_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
         run: scripts/generate
+      - name: Check tailscaled integration test dependencies
+        working-directory: source
+        run: |
+          ./tool/go generate ./tstest/integration
+          git diff --exit-code HEAD
+          test -z "$(git ls-files --others --exclude-standard)"
       - name: Test changed packages
         working-directory: source
         shell: bash
