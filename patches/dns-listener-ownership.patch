@@ -37,9 +37,14 @@ Signed-off-by: Brody Franks <brody@franks.id.au>
  net/tsaddr/tsaddr.go                  |  5 ++
  tsnet/tsnet.go                        |  3 +
  tstest/integration/daemon_dns_test.go | 55 +++++++++++++++++
+ .../tailscaled_deps_test_darwin.go    |  1 +
+ .../tailscaled_deps_test_freebsd.go   |  1 +
+ .../tailscaled_deps_test_linux.go     |  1 +
+ .../tailscaled_deps_test_openbsd.go   |  1 +
+ .../tailscaled_deps_test_windows.go   |  1 +
  wgengine/userspace.go                 |  6 +-
  wgengine/userspace_test.go            | 13 ++--
- 23 files changed, 275 insertions(+), 119 deletions(-)
+ 28 files changed, 280 insertions(+), 119 deletions(-)
  create mode 100644 tstest/integration/daemon_dns_test.go
 
 diff --git a/cmd/tailscaled/tailscaled.go b/cmd/tailscaled/tailscaled.go
@@ -902,6 +907,66 @@ index 0000000000000000000000000000000000000000..55256fc8abcbd74ad815e1a4cbaac3b1
 +		t.Error(err)
 +	}
 +}
+diff --git a/tstest/integration/tailscaled_deps_test_darwin.go b/tstest/integration/tailscaled_deps_test_darwin.go
+index f8c1a62b010e854a975dc0dc745d9f41fb97de2b..350b7d75cf2501521de8ad6f98e5125788764bb2 100644
+--- a/tstest/integration/tailscaled_deps_test_darwin.go
++++ b/tstest/integration/tailscaled_deps_test_darwin.go
+@@ -37,6 +37,7 @@
+ 	_ "tailscale.com/net/netns"
+ 	_ "tailscale.com/net/proxymux"
+ 	_ "tailscale.com/net/socks5"
++	_ "tailscale.com/net/tsaddr"
+ 	_ "tailscale.com/net/tsdial"
+ 	_ "tailscale.com/net/tstun"
+ 	_ "tailscale.com/paths"
+diff --git a/tstest/integration/tailscaled_deps_test_freebsd.go b/tstest/integration/tailscaled_deps_test_freebsd.go
+index f8c1a62b010e854a975dc0dc745d9f41fb97de2b..350b7d75cf2501521de8ad6f98e5125788764bb2 100644
+--- a/tstest/integration/tailscaled_deps_test_freebsd.go
++++ b/tstest/integration/tailscaled_deps_test_freebsd.go
+@@ -37,6 +37,7 @@
+ 	_ "tailscale.com/net/netns"
+ 	_ "tailscale.com/net/proxymux"
+ 	_ "tailscale.com/net/socks5"
++	_ "tailscale.com/net/tsaddr"
+ 	_ "tailscale.com/net/tsdial"
+ 	_ "tailscale.com/net/tstun"
+ 	_ "tailscale.com/paths"
+diff --git a/tstest/integration/tailscaled_deps_test_linux.go b/tstest/integration/tailscaled_deps_test_linux.go
+index f8c1a62b010e854a975dc0dc745d9f41fb97de2b..350b7d75cf2501521de8ad6f98e5125788764bb2 100644
+--- a/tstest/integration/tailscaled_deps_test_linux.go
++++ b/tstest/integration/tailscaled_deps_test_linux.go
+@@ -37,6 +37,7 @@
+ 	_ "tailscale.com/net/netns"
+ 	_ "tailscale.com/net/proxymux"
+ 	_ "tailscale.com/net/socks5"
++	_ "tailscale.com/net/tsaddr"
+ 	_ "tailscale.com/net/tsdial"
+ 	_ "tailscale.com/net/tstun"
+ 	_ "tailscale.com/paths"
+diff --git a/tstest/integration/tailscaled_deps_test_openbsd.go b/tstest/integration/tailscaled_deps_test_openbsd.go
+index f8c1a62b010e854a975dc0dc745d9f41fb97de2b..350b7d75cf2501521de8ad6f98e5125788764bb2 100644
+--- a/tstest/integration/tailscaled_deps_test_openbsd.go
++++ b/tstest/integration/tailscaled_deps_test_openbsd.go
+@@ -37,6 +37,7 @@
+ 	_ "tailscale.com/net/netns"
+ 	_ "tailscale.com/net/proxymux"
+ 	_ "tailscale.com/net/socks5"
++	_ "tailscale.com/net/tsaddr"
+ 	_ "tailscale.com/net/tsdial"
+ 	_ "tailscale.com/net/tstun"
+ 	_ "tailscale.com/paths"
+diff --git a/tstest/integration/tailscaled_deps_test_windows.go b/tstest/integration/tailscaled_deps_test_windows.go
+index 08efd0349fa7fa2f360267b2f389e5dcb49ab4db..833a3753aac003369619584c00269808c1ced9f5 100644
+--- a/tstest/integration/tailscaled_deps_test_windows.go
++++ b/tstest/integration/tailscaled_deps_test_windows.go
+@@ -46,6 +46,7 @@
+ 	_ "tailscale.com/net/netns"
+ 	_ "tailscale.com/net/proxymux"
+ 	_ "tailscale.com/net/socks5"
++	_ "tailscale.com/net/tsaddr"
+ 	_ "tailscale.com/net/tsdial"
+ 	_ "tailscale.com/net/tstun"
+ 	_ "tailscale.com/paths"
 diff --git a/wgengine/userspace.go b/wgengine/userspace.go
 index 85ee9e6789d523af2941f2596fdea24fb592f1eb..cca9f8c7011612e977780b15a1070dba91600030 100644
 --- a/wgengine/userspace.go
